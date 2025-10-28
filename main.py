@@ -20,14 +20,14 @@ def main():
         s = np.random.randint(2, size=nv)
         for _ in range(max):
             bv = np.dot(sqv, s) + np.dot(co, s)
+            xor_bv = s ^ np.ones(nv, dtype=np.int32)
             for j in range(nv):
-                up = (s[j] + 1) % 2
-                if up == 1:
+                if xor_bv[j] == 1:
                     du = -bv[j]
                 else:
                     du = bv[j]
                     if du < 0:
-                        s[j] = up
+                        s[j] = xor_bv[j]
                         es = np.dot(s, np.dot(sqv, s)) + 2 * dv * np.dot(s, s)
                         if es < e:
                             e = es
