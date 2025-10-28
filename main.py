@@ -19,19 +19,15 @@ def main():
     for _ in range(it):
         s = np.random.randint(2, size=nv)
         for _ in range(max):
-            bv = np.dot(sqv, s) + np.dot(co, s)
-            xor_bv = s ^ np.ones(nv, dtype=np.int32)
+            bv = np.dot(sqv, s) + np.sum(s) * 2 * dv
+
             for j in range(nv):
-                if xor_bv[j] == 1:
-                    du = -bv[j]
-                else:
-                    du = bv[j]
-                    if du < 0:
-                        s[j] = xor_bv[j]
-                        es = np.dot(s, np.dot(sqv, s)) + 2 * dv * np.dot(s, s)
-                        if es < e:
-                            e = es
-                            si = s.copy()
+                if s[j] == 1 and bv[j] < 0:
+                    s[j] = 0
+                    es = np.dot(s, np.dot(sqv, s)) + 2 * dv * np.sum(s)
+                    if es < e:
+                        e = es
+                        si = s.copy()
 
     print(e)
     print(si[:10], si[-10:])
