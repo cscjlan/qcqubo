@@ -2,37 +2,58 @@ import numpy as np
 import time
 
 
-def main():
-    np.random.seed(6)
+class Sparse:
+    def __init__(self, arr: np.ndarray):
+        assert len(arr.shape) == 2
+        assert arr.shape[0] == arr.shape[1]
 
-    nv = 1001
+        self.arr = arr
+        nonzero_inds = np.where(self.arr != 0.0)
+        values = self.arr[nonzero_inds]
+        rows = [[] for _ in range(self.arr.shape[0])]
+        for i, row in enumerate(nonzero_inds[0]):
+            rows[row].append((nonzero_inds[1][i], values[i]))
+
+        print(len(rows[1]))
+        print(len(np.where(nonzero_inds[0] == 1.0)[0]))
+
+
+def solve(arr: np.ndarray):
     e = 100000
     dv = 0.000336499
-    sqv = np.genfromtxt("sqv.csv", delimiter=",")
+    nv = arr.shape[0]
+
+    si = np.ones(nv)
+
     co = np.ones(nv)
     co = 2 * dv * co
 
-    max = 50  # could try a bit smaller like 20 or larger like 100
-    it = 100  # number of iterations, as large as possible, millions...
-
-    si = np.ones(nv)
+    it = 100000  # number of iterations, as large as possible, millions...
     for _ in range(it):
         s = np.random.randint(2, size=nv)
-        for _ in range(max):
-            bv = np.dot(sqv, s) + np.sum(s) * 2 * dv
-
-            for j in range(nv):
-                if s[j] == 1 and bv[j] < 0:
-                    s[j] = 0
-                    es = np.dot(s, np.dot(sqv, s)) + 2 * dv * np.sum(s)
-                    if es < e:
-                        e = es
-                        si = s.copy()
+        sum_s = 2 * dv * np.sum(s)
+        es = np.dot(s, np.dot(arr, s)) + sum_s
+        if es < e:
+            e = es
+            si = s.copy()
 
     print(e)
-    print(si[:10], si[-10:])
-    validate = np.loadtxt("validate.csv", delimiter=",")
-    assert (validate == si).all()
+    print(si)
+    # validate = np.loadtxt("validate.csv", delimiter=",")
+    # assert (validate == si).all()
+
+
+def sparse_solve(arr: np.ndarray):
+    sparse = Sparse(arr)
+    print(sparse.arr.shape)
+
+
+def main():
+    np.random.seed(6)
+    sqv = np.genfromtxt("sqv.csv", delimiter=",")
+
+    solve(sqv)
+    # sparse_solve(sqv)
 
 
 if __name__ == "__main__":
