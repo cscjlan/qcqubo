@@ -17,24 +17,21 @@ def main():
 
     si = np.ones(nv)
     for _ in range(it):
-        s0 = np.random.randint(2, size=nv)
-        s1 = s0.copy()
+        s = np.random.randint(2, size=nv)
         for _ in range(max):
-            sx = s1.copy()
+            bv = np.dot(sqv, s) + np.dot(co, s)
             for j in range(nv):
-                up = (s1[j] + 1) % 2
-                se = sqv[j]
-                bv = np.dot(se, sx) + np.dot(co, sx)
+                up = (s[j] + 1) % 2
                 if up == 1:
-                    du = -bv
+                    du = -bv[j]
                 else:
-                    du = bv
+                    du = bv[j]
                     if du < 0:
-                        s1[j] = up
-                        es = np.dot(s1, np.dot(sqv, s1)) + 2 * dv * np.dot(s1, s1)
+                        s[j] = up
+                        es = np.dot(s, np.dot(sqv, s)) + 2 * dv * np.dot(s, s)
                         if es < e:
                             e = es
-                            si = s1.copy()
+                            si = s.copy()
 
     print(e)
     print(si[:10], si[-10:])
