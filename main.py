@@ -4,21 +4,19 @@ import scipy.sparse.linalg as linalg
 
 
 def generate_sparse_symmetric_real_matrix(n):
-    # generate a sparse symmetric real matrix
-    print("generating")
-    prob = np.log10(n) ** 4 / n
-    mat = sparse.lil_array((n, n), dtype=np.float64)
-    for i in range(n):
-        for j in range(i, n):
-            if i == j:
-                mat[i, j] = 2.0 * (np.random.random() - 0.5)
-                continue
+    mat = np.random.random((n, n))
+    mat = mat + mat.T - 1.0
 
-            val = np.random.random()
-            if val < prob:
-                val /= 2.0 * (prob - 0.5)
-                mat[i, j] = val
-                mat[j, i] = val
+    prob = 1.0 - np.sqrt(1.0 - np.log10(n) ** 4 / n)
+    mask = np.random.binomial(1, prob, (n, n))
+    mask = ((mask + mask.T) > 0).astype(np.int64)
+
+    return sparse.csr_array(mask * mat)
+
+
+def generate_sparse_symmetric_real_matrix2(n):
+    mat = np.random.random((n, n))
+    mat = mat + mat.T - 1.0
 
     return sparse.csr_array(mat)
 
@@ -134,21 +132,21 @@ def compute_lower_limit(x, eigenvalue):
 
 
 def sparse_eigen_greedy(sq, vectors):
-    print("computing eigenvalues")
     candidates = np.hstack(
         ((vectors < 0).astype(np.int64), (vectors > 0).astype(np.int64))
     )
     minimum_value = np.inf
     min_x = np.zeros(sq.shape[0])
 
-    half_diag = 0.5 * sq.diagonal()
-    num_iters = 0
-    for x in candidates.T:
-        energies = (sq @ x) - 2.0 * half_diag * x
+    diagonal = sq.diagonal()
+    num_iters = np.zeros(candidates.shape[1])
+    for ci, x in enumerate(candidates.T):
+        energies = sq @ x
 
         while True:
-            num_iters += 1
-            delta = (energies + half_diag) * (-2 * x + 1)
+            num_iters[ci] += 1
+            sign = -2 * x + 1
+            delta = sign * (2.0 * energies + sign * diagonal)
             i = np.argmin(delta)
 
             if delta[i] >= 0:
@@ -160,17 +158,13 @@ def sparse_eigen_greedy(sq, vectors):
             row_indices = sq.indices[begin:end]
             row_data = sq.data[begin:end]
 
-            # Remove the diagonal
-            column_indices = row_indices[row_indices != i]
-            column_data = row_data[row_indices != i]
-
             # Update the row energies
             # This works due to symmetry of sq
-            energies[column_indices] += column_data
+            energies[row_indices] += row_data * (-2 * x[i] + 1)
 
             x[i] = abs(x[i] - 1)
 
-        value = x @ sq @ x
+        value = np.dot(energies, x)
         if value < minimum_value:
             minimum_value = value
             min_x = x
@@ -194,12 +188,13 @@ def with_small(q, values, vectors):
 
 
 def main():
-    # TODO for some reason this always returns vector full of ones
     np.random.seed(22234)
-    # sqv = np.genfromtxt("sqv.csv", delimiter=",")
-    n = 200
-    sq = generate_sparse_symmetric_real_matrix(n)
-    values, vectors = linalg.eigsh(sq, np.min([2, sq.shape[0] - 1]), which="SA")
+    # sq = sparse.csr_array(np.genfromtxt("sqv.csv", delimiter=","))
+    # n = sq.shape[0]
+    n = 1000
+    sq = generate_sparse_symmetric_real_matrix2(n)
+    values, vectors = linalg.eigsh(sq, sq.shape[0] / 2, which="SA")
+    # cv = np.sum(vectors, axis=1).reshape((vectors.shape[0], 1))
 
     if n <= 22:
         q = sq.toarray()
