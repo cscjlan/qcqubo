@@ -1,0 +1,10 @@
+---
+# Fragment specific to C++ source files
+If:
+    PathMatch: [.*\.cpp, .*\.hpp]
+CompileFlags:
+  Add:
+    - --rocm-path=/opt/rocm/
+    - -I/opt/rocm/include
+    - -D__HIP_PLATFORM_AMD__
+    - -xhip

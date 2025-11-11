@@ -4,6 +4,7 @@ import scipy.sparse.linalg as linalg
 
 
 def generate_sparse_symmetric_real_matrix(n):
+    print(f"Generating a sparse symmetric real matrix of size {n}x{n}")
     mat = np.random.random((n, n))
     mat = mat + mat.T - 1.0
 
@@ -12,110 +13,6 @@ def generate_sparse_symmetric_real_matrix(n):
     mask = ((mask + mask.T) > 0).astype(np.int64)
 
     return sparse.csr_array(mask * mat)
-
-
-def generate_sparse_symmetric_real_matrix2(n):
-    mat = np.random.random((n, n))
-    mat = mat + mat.T - 1.0
-
-    return sparse.csr_array(mat)
-
-
-def integer_to_binary_vector(integer, num_bits):
-    return np.array(
-        [(integer >> (num_bits - position - 1)) & 1 for position in range(num_bits)]
-    )
-
-
-def test_integer_to_binary_vec(vec, integer, num_bits):
-    converted = integer_to_binary_vector(integer, num_bits)
-    for i, value in enumerate(vec):
-        assert value == converted[i]
-
-
-def evaluate(x, q):
-    return x.T @ q @ x
-
-
-def brute_force_minimum(q):
-    vec_size = q.shape[0]
-    num_values = 2**vec_size
-    minimum_value = np.inf
-    min_x = np.zeros(vec_size)
-    for i in range(num_values):
-        x = integer_to_binary_vector(i, vec_size)
-        value = evaluate(x, q)
-        if value < minimum_value:
-            minimum_value = value
-            min_x = x
-
-    return (num_values, minimum_value, min_x)
-
-
-def greedy_search(x, q):
-    vec_size = q.shape[0]
-    min_x = x.copy()
-    minimum_value = evaluate(min_x, q)
-
-    num_iters = 0
-    while True:
-        num_iters += 1
-        min_i = -1
-        for i in range(vec_size):
-            min_x[i] = abs(min_x[i] - 1)
-            value = evaluate(min_x, q)
-            if value < minimum_value:
-                minimum_value = value
-                min_i = i
-            min_x[i] = abs(min_x[i] - 1)
-
-        # flip the minimum bit
-        if min_i > 0:
-            min_x[min_i] = abs(min_x[min_i] - 1)
-            continue
-
-        break
-
-    return (minimum_value, min_x, num_iters)
-
-
-def eig_minimum(q, values, vectors):
-    vec_size = q.shape[0]
-    i = 0
-
-    minimum_value = np.inf
-    min_x = np.zeros(vec_size)
-
-    while i < values.shape[0] and values[i] < 0:
-        eigvec = vectors[:, i]
-
-        # Test the direction for which all values in the eigenvector are negative
-        # value, x = greedy_search((eigvec < 0).astype(np.int64), q)
-        x = (eigvec < 0).astype(np.int64)
-        value = evaluate(x, q)
-
-        if value < minimum_value:
-            minimum_value = value
-            min_x = x
-
-        # Test the direction for which all values in the eigenvector are positive
-        # value, x = greedy_search((eigvec > 0).astype(np.int64), q)
-        x = (eigvec > 0).astype(np.int64)
-        value = evaluate(x, q)
-
-        if value < minimum_value:
-            minimum_value = value
-            min_x = x
-
-        i += 1
-
-    # Perform greedy search until we reach a minimum
-    value, x, num_greedy_iters = greedy_search(min_x, q)
-    if value < minimum_value:
-        minimum_value = value
-        min_x = x
-
-    return (i, minimum_value, min_x, num_greedy_iters)
 
 
 def compute_lower_limit(x, eigenvalue):
@@ -131,86 +28,154 @@ def compute_lower_limit(x, eigenvalue):
     return np.sum(x) * eigenvalue
 
 
-def sparse_eigen_greedy(sq, vectors):
-    candidates = np.hstack(
-        ((vectors < 0).astype(np.int64), (vectors > 0).astype(np.int64))
-    )
-    minimum_value = np.inf
-    min_x = np.zeros(sq.shape[0])
+class Greedy:
+    def __init__(self, sq):
+        self.diagonal = sq.diagonal()
+        self.i = 0
 
-    diagonal = sq.diagonal()
-    num_iters = np.zeros(candidates.shape[1])
-    for ci, x in enumerate(candidates.T):
-        energies = sq @ x
+    def keep_searching(self, candidate):
+        sign = -2 * candidate.x + 1
+        delta = sign * (2.0 * candidate.energies + sign * self.diagonal)
+        self.i = np.argmin(delta)
 
-        while True:
+        return delta[self.i] < 0.0
+
+    def index(self):
+        return self.i
+
+
+class Travel:
+    def __init__(self, target):
+        self.target = target
+        self.i = 0
+
+    def keep_searching(self, candidate):
+        values = np.nonzero(candidate.x - self.target)[0]
+        any_different = len(values) > 0
+        if any_different:
+            self.i = values[0]
+
+        return any_different
+
+    def index(self):
+        return self.i
+
+
+class Candidate:
+    def __init__(self, sq, x, name):
+        self.name = name
+        self.x = x
+        self.minimum_x = x.copy()
+        self.energies = sq @ x
+        self.total_energy = np.dot(self.x, self.energies)
+        self.minimum_energy = self.total_energy
+
+    def update(self, i, sq):
+        # sq is a sparse array
+        begin = sq.indptr[i]
+        end = sq.indptr[i + 1]
+
+        row_indices = sq.indices[begin:end]
+        row_data = sq.data[begin:end]
+
+        # Update energies for rows
+        delta = row_data * (-2 * self.x[i] + 1)
+        self.energies[row_indices] += delta
+
+        # Flip bit i
+        self.x[i] = abs(self.x[i] - 1)
+
+        self.total_energy = np.dot(self.energies, self.x)
+
+        if self.total_energy < self.minimum_energy:
+            self.minimum_energy = self.total_energy
+            self.minimum_x = self.x.copy()
+
+
+def search(sq, candidates, local_search):
+    num_iters = np.zeros(len(candidates))
+    for ci, candidate in enumerate(candidates):
+        while local_search.keep_searching(candidate):
+            candidate.update(local_search.index(), sq)
             num_iters[ci] += 1
-            sign = -2 * x + 1
-            delta = sign * (2.0 * energies + sign * diagonal)
-            i = np.argmin(delta)
 
-            if delta[i] >= 0:
-                break
-
-            # Find the indices and data for matrix row i
-            begin = sq.indptr[i]
-            end = sq.indptr[i + 1]
-            row_indices = sq.indices[begin:end]
-            row_data = sq.data[begin:end]
-
-            # Update the row energies
-            # This works due to symmetry of sq
-            energies[row_indices] += row_data * (-2 * x[i] + 1)
-
-            x[i] = abs(x[i] - 1)
-
-        value = np.dot(energies, x)
-        if value < minimum_value:
-            minimum_value = value
-            min_x = x
-
-    return (num_iters, minimum_value, min_x)
+    return num_iters
 
 
-def with_small(q, values, vectors):
-    brute_num_values, brute_minimum_value, brute_min_x = brute_force_minimum(q)
-    eig_num_values, eig_minimum_value, eig_min_x, num_greedy_iters = eig_minimum(
-        q, values, vectors
+def generate_initial_candidates(sq):
+    num_eigenvalues = 100
+    num_eigenvalues = np.min((int(sq.shape[0] / 2), num_eigenvalues))
+    _, vectors = linalg.eigsh(sq, num_eigenvalues, which="SA")
+    sum_vec = np.sum(vectors, axis=1).reshape((vectors.shape[0], 1))
+
+    randoms = np.random.randint(0, 2, size=(vectors.shape[0], num_eigenvalues))
+
+    candidate_xs = np.hstack(
+        (
+            (vectors < 0).astype(np.int64),
+            (vectors > 0).astype(np.int64),
+            (sum_vec < 0).astype(np.int64),
+            (sum_vec > 0).astype(np.int64),
+            randoms,
+        )
     )
 
-    print(f"brute minimum: {brute_minimum_value}, eig minimum: {eig_minimum_value}")
-    print(
-        f"Brute values searched: {brute_num_values}, eig values searched: {eig_num_values}, greedy iters: {num_greedy_iters}"
-    )
-    print("Bit vectors (brute first, eig second)")
-    print(brute_min_x)
-    print(eig_min_x)
+    def make_name(i, num_eigenvalues):
+        if i <= num_eigenvalues:
+            return "-" + str(i)
+        elif i <= 2 * num_eigenvalues:
+            return "+" + str(i - num_eigenvalues)
+        elif i <= 2 * num_eigenvalues + 1:
+            return "-s"
+        elif i <= 2 * num_eigenvalues + 2:
+            return "+s"
+
+        return "r" + str(i - 2 * (num_eigenvalues + 1))
+
+    return [
+        Candidate(sq, x, make_name(i + 1, num_eigenvalues))
+        for i, x in enumerate(candidate_xs.T)
+    ]
 
 
 def main():
-    np.random.seed(22234)
+    np.random.seed(24)
     # sq = sparse.csr_array(np.genfromtxt("sqv.csv", delimiter=","))
-    # n = sq.shape[0]
-    n = 1000
-    sq = generate_sparse_symmetric_real_matrix2(n)
-    values, vectors = linalg.eigsh(sq, sq.shape[0] / 2, which="SA")
-    # cv = np.sum(vectors, axis=1).reshape((vectors.shape[0], 1))
+    sq = generate_sparse_symmetric_real_matrix(1000)
 
-    if n <= 22:
-        q = sq.toarray()
-        with_small(q, values, vectors)
+    print("Generating candidates")
+    candidates = generate_initial_candidates(sq)
 
-    sge_num_iters, sge_minimum_value, sge_min_x = sparse_eigen_greedy(sq, vectors)
-    lower_limit = compute_lower_limit(sge_min_x, values[0])
-    print(f"sge_num_iters: {sge_num_iters}")
-    print(f"sge_minimum_value: {sge_minimum_value}, lower limit: {lower_limit}")
-    print(f"sge_min_x: {sge_min_x}")
+    print("Searching around eigenvectors")
+    # num_iters = search(sq, candidates, Greedy(sq))
+    num_iters = search(sq, candidates, Travel(np.ones(sq.shape[0])))
+    candidates.sort(key=lambda candidate: candidate.total_energy)
+    minimum_candidate = candidates[0]
+
+    print("Computing lower limit for minimum value")
+    values, _ = linalg.eigsh(sq, 1, which="SA")
+    lower_limit = compute_lower_limit(minimum_candidate.minimum_x, values[0])
+
+    print(f"number of iterations: {np.sum(num_iters)}")
+    print(f"lower limit: {lower_limit}")
+    for c in candidates[:10]:
+        print(
+            f"{c.name}: {c.total_energy}, {np.sqrt(np.dot(candidates[0].minimum_x - c.minimum_x, candidates[0].minimum_x - c.minimum_x))}"
+        )
+    print(
+        f"sge_min_x: {minimum_candidate.minimum_x[:10]}...{minimum_candidate.minimum_x[-10:]}"
+    )
 
 
 if __name__ == "__main__":
-    test_integer_to_binary_vec([0, 0, 0, 1], 1, 4)
-    test_integer_to_binary_vec([0, 0, 1, 0], 2, 4)
-    test_integer_to_binary_vec([0, 0, 1, 1], 3, 4)
-    test_integer_to_binary_vec([1, 0, 1, 1], 11, 4)
-
-    main()
+    np.random.seed(24)
+    # sq = sparse.csr_array(np.genfromtxt("sqv.csv", delimiter=","))
+    for i in range(1):
+        sq = generate_sparse_symmetric_real_matrix(200)
+        with open("generated_" + str(i) + ".csv", "w") as f:
+            sq.indptr.tofile(f, sep=",")
+            f.write("\n")
+            sq.indices.tofile(f, sep=",")
+            f.write("\n")
+            sq.data.tofile(f, sep=",")
+    # main()
