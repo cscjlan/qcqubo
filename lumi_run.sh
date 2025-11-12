@@ -12,4 +12,5 @@ ml PrgEnv-cray/8.5.0
 ml craype-accel-amd-gfx90a
 ml rocm/6.0.3
 
-srun rocprof --hip-trace ./qubo
+#srun rocprof --hip-trace ./qubo
+srun ./qubo

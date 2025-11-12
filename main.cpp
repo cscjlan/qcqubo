@@ -2,7 +2,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <hip/hip_runtime.h>
+#include <iostream>
 #include <memory>
+#include <numeric>
 #include <span>
 #include <utility>
 #include <vector>
@@ -39,24 +41,6 @@ inline void memcpy(void *dst, const void *src, size_t num_bytes) {
 }
 
 inline void synchronize() { HIP_ERRCHK(hipDeviceSynchronize()); }
-
-template <typename F, typename... Args>
-__global__ void loop_kernel(F f, int nx, int ny, Args... args) {
-    const auto tidx = threadIdx.x + blockIdx.x * blockDim.x;
-    const auto tidy = threadIdx.y + blockIdx.y * blockDim.y;
-    const auto stridex = blockDim.x * gridDim.x;
-    const auto stridey = blockDim.y * gridDim.y;
-
-    const auto num_values = nx * ny;
-    for (auto y = tidy; y < ny; y += stridey) {
-        const auto offset = y * nx;
-        for (auto x = tidx; x < nx; x += stridex) {
-            f(offset + x, num_values, args...);
-        }
-    }
-}
-
-void hip_errchk(hipError_t result, const char *file, int32_t line);
 
 template <typename... Args>
 void launch_kernel(const char *kernel_name, const char *file, int32_t line,
@@ -176,6 +160,16 @@ void launch_kernel(const char *kernel_name, const char *file, int32_t line,
     }
 #endif
 }
+
+inline uint32_t warpSize() {
+    int32_t device = 0;
+    HIP_ERRCHK(hipGetDevice(&device));
+
+    int32_t value = 0;
+    HIP_ERRCHK(hipDeviceGetAttribute(
+        &value, hipDeviceAttribute_t::hipDeviceAttributeWarpSize, device));
+    return value;
+}
 } // namespace gpu
 
 struct SparseMatrix {
@@ -235,13 +229,11 @@ struct SparseMatrix {
     }
 };
 
-__device__ float warpReduction(float value) {
-    // TODO test this
-    uint32_t i = 1;
-    uint32_t n = warpSize >> i;
-    while (n > 1) {
-        value += __shfl_down(value, n);
-        n = warpSize >> ++i;
+template <typename T, typename Op> __device__ T warpReduction(T value, Op op) {
+    uint32_t n = warpSize >> 1;
+    while (n > 0) {
+        value = op(value, __shfl_down(value, n));
+        n >>= 1;
     }
 
     return value;
@@ -269,7 +261,7 @@ __global__ void testMatrixProduct(SparseMatrix matrix, std::span<float> x,
         }
 
         // Row has been summed by the block, perform a reduction
-        sum = warpReduction(sum);
+        sum = warpReduction(sum, [](auto a, auto b) { return a + b; });
         // Now thread 0 has the result computed by the warp
         // TODO thread 0 should write to shared memory (based on warp id)
         // then syncthreads, then first warp performs the reduction again
@@ -277,10 +269,12 @@ __global__ void testMatrixProduct(SparseMatrix matrix, std::span<float> x,
     }
 }
 
-__global__ void testWarpReduction() {
-    const float value = warpReduction(threadIdx.x);
+template <typename T, typename Op>
+__global__ void warpReductionKernel(std::span<T> values, Op op) {
+    auto value = threadIdx.x < values.size() ? values[threadIdx.x] : 0;
+    value = warpReduction(value, op);
     if (threadIdx.x == 0) {
-        printf("%f\n", value);
+        values[0] = value;
     }
 }
 
@@ -306,8 +300,53 @@ void testSparseMatrix() {
     gpu::synchronize();
 }
 
+void testWarpReduction() {
+    const uint32_t n = gpu::warpSize();
+    auto mem = gpu::allocate(sizeof(double) * n);
+
+    auto launchWarpReduction =
+        []<typename T, typename Op>(std::span<T> values,
+                                    const std::vector<T> &h_values, Op op) {
+            gpu::memcpy(values.data(), h_values.data(), values.size_bytes());
+
+            LAUNCH_KERNEL(warpReductionKernel, 1, values.size(), 0, 0, "",
+                          values, op);
+
+            T result = 0;
+            gpu::memcpy(&result, values.data(), sizeof(T));
+            T h_result = std::reduce(h_values.cbegin() + 1, h_values.cend(),
+                                     h_values[0], op);
+
+            std::cout << result << ", " << h_result << std::endl;
+
+            assert(result == h_result);
+        };
+
+    launchWarpReduction(
+        std::span(static_cast<uint32_t *>(mem), n),
+        [&n]() {
+            std::vector<uint32_t> values(n);
+            std::iota(values.begin(), values.end(), 0);
+            return values;
+        }(),
+        [](auto a, auto b) { return a + b; });
+
+    launchWarpReduction(
+        std::span(static_cast<float *>(mem), n),
+        [&n]() {
+            std::vector<float> values(n);
+            std::generate(values.begin(), values.end(), [&n, i = 0]() mutable {
+                return -static_cast<float>(n) / 2.0f + (i++);
+            });
+            return values;
+        }(),
+        [](auto a, auto b) { return a < b ? a : b; });
+
+    gpu::free(mem);
+}
+
 int main() {
     testSparseMatrix();
-    LAUNCH_KERNEL(testWarpReduction, 1, 64, 0, 0, "");
+    testWarpReduction();
     gpu::synchronize();
 }
