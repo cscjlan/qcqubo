@@ -214,7 +214,7 @@ __device__ consteval uint32_t asPowOfTwo() {
     return POW;
 }
 
-// This only supporst square matrices
+// This only supports square matrices
 template <typename T> struct SparseMatrix {
     static size_t numBytesReq(size_t ndata, size_t nrows) {
         // Add one extra for alignment and nrows for the diagonal
@@ -337,15 +337,111 @@ template <typename T> struct SparseMatrix {
     }
 };
 
+template <typename T> struct SuperSpan {
+    // This structure has a span to some data that is used by the entire grid
+    // Each block has a unique sub span  within the super span
+    // They are aligned by ALIGN in the super span and each is the same length
+  private:
+    // Align to 256 byte boundary
+    static constexpr size_t ALIGN = 256ull / sizeof(T);
+    std::span<T> data;
+    uint32_t num_subspans = 0;
+    uint32_t subspan_len = 0;
+
+    static uint32_t requiredLength(uint32_t num_subspans,
+                                   uint32_t subspan_len) {
+        return num_subspans * width(num_subspans, subspan_len);
+    }
+
+    __device__ __host__ static uint32_t width(uint32_t num_subspans,
+                                              uint32_t subspan_len) {
+        // Compute the width of the subspan
+        // If subspan_len is aligned to ALIGN, i.e. remainder == 0
+        // the width is equal to subspan_len
+        const uint32_t remainder = subspan_len & (ALIGN - 1);
+        const uint32_t padding = (ALIGN - remainder) & (ALIGN - 1);
+        return subspan_len + padding;
+    }
+
+  public:
+    static uint32_t memReq(uint32_t num_subspans, uint32_t subspan_len) {
+        return requiredLength(num_subspans, subspan_len) * sizeof(T);
+    }
+
+    SuperSpan(std::span<T> d, uint32_t num, uint32_t len)
+        : data(d), num_subspans(num), subspan_len(len) {
+        static_assert(ALIGN > 0, "ALIGN must be greater than zero");
+        static_assert((ALIGN & (ALIGN - 1)) == 0,
+                      "ALIGN must be a power of two");
+        assert(d.size() == requiredLength(num_subspans, subspan_len));
+    }
+
+    __device__ __host__ std::span<T> subspan(uint32_t i) const {
+        assert(i < num_subspans);
+        // Skip all the i widths before this subspan
+        const uint32_t begin = i * width(num_subspans, subspan_len);
+
+        // Are we inside the super span?
+        assert(begin + subspan_len < data.size());
+
+        return std::span<T>(data.data() + begin, subspan_len);
+    }
+
+    __device__ __host__ uint32_t subspanLength() const { return subspan_len; }
+};
+
+struct BitVector {
+    // This structure is a bit vector, where 32 bits are stored as a single
+    // value. We're using 4 byte values to avoid bank conflicts in shared memory
+    // when multiple threads want to access a bit from the same value: with 4
+    // bytes per value, all (potentially 32) threads access the same (starting)
+    // byte within the 4 byte bank, so the value can be broadcast efficiently.
+    using S = uint32_t;
+
+  private:
+    uint32_t len;
+    std::span<S> data;
+    static constexpr uint32_t BITS_PER_TYPE = 8u * sizeof(S);
+    static constexpr uint32_t POW_OF_TWO = asPowOfTwo<BITS_PER_TYPE, 0>();
+
+  public:
+    __device__ __host__ BitVector(uint32_t l, std::span<S> d)
+        : len(l), data(d) {}
+
+    static uint32_t requiredLength(uint32_t len) {
+        return (len >> POW_OF_TWO) + 1;
+    }
+
+    static size_t memReq(uint32_t len) {
+        return static_cast<size_t>(requiredLength(len)) * sizeof(S);
+    }
+
+    template <typename T> __device__ __host__ T operator[](uint32_t i) const {
+        // We should return the bit at index i
+        // We'll unpack the correct value in data and return the correct bit
+        // from that value
+        assert(i < data.size() * BITS_PER_TYPE);
+        const auto data_idx = i >> POW_OF_TWO;
+        const auto bit_idx = i & (BITS_PER_TYPE - 1);
+        return static_cast<T>((data[data_idx] >> bit_idx) & 1);
+    }
+
+    // Return the underlying span for efficient copies/inserts of 4 byte values
+    std::span<S> span() const { return data; }
+
+    // How many bits are actual data
+    size_t size() const { return len; }
+};
+
 // TODO: test
 template <typename T>
-__device__ void mx(const typename SparseMatrix<T>::View &m,
-                   std::span<uint32_t> x, std::span<T> y) {
-    constexpr static uint32_t bits_per_x = 8 * sizeof(decltype(x[0]));
-
-    // TODO check this is correct length for x
-    assert(m.shape().first == y.size());
-    assert(m.shape().second == bits_per_x * x.size());
+__device__ void mx(const typename SparseMatrix<T>::View &m, BitVector x,
+                   std::span<T> y) {
+    const auto shape = m.shape();
+    const auto num_rows = shape.first;
+    const auto num_cols = shape.second;
+    assert(x.size() == num_cols);
+    assert(y.size() == num_rows);
 
     const uint32_t wid = gpu::warpID();
     const uint32_t wstride = gpu::numWarpsInBlock();
@@ -353,21 +449,14 @@ __device__ void mx(const typename SparseMatrix<T>::View &m,
     const uint32_t lanestride =
         gpu::WARP_SIZE < blockDim.x ? gpu::WARP_SIZE : blockDim.x;
 
-    // TODO: unpacking bits should/could be done in a function
-    for (auto row = wid; row < m.shape().first; row += wstride) {
+    for (auto row = wid; row < num_rows; row += wstride) {
         const auto row_indices = m.rowIndices(row);
         const auto row_data = m.rowData(row);
         auto sum = static_cast<T>(0);
         for (auto i = lane; i < row_indices.size(); i += lanestride) {
             // j is the column of the matrix
             const auto j = row_indices[i];
-            // x_id is the index to the x vector, with multiple bits per x
-            const auto x_id = j >> asPowOfTwo<bits_per_x, 0>();
-            // bit_id contains the correct bit from the fetched x value
-            const auto bit_id = j & (bits_per_x - 1);
-            // Finally, perform a product between the matrix value at (row, j)
-            // and the bit j in the bit vector
-            sum += row_data[i] * (x[x_id] >> bit_id) & 1;
+            sum += row_data[i] * x[j];
         }
 
         // Only thread 0 gets the correct value
@@ -382,7 +471,7 @@ __device__ void mx(const typename SparseMatrix<T>::View &m,
     __syncthreads();
 }
 
-__device__ void generateRandomX(std::span<uint32_t> x) {
+__device__ void generateRandomX(BitVector x) {
     // TODO
 }
 
@@ -429,7 +518,7 @@ __device__ T blockReduce(std::span<T> data, std::span<T> scratch, Op op,
 
 template <typename T>
 __device__ bool keepSearching(const typename SparseMatrix<T>::View &m,
-                              std::span<uint32_t> x, std::span<T> y,
+                              BitVector x, std::span<T> y,
                               std::span<T> scratch) {
     // do the computations, then recudction to scratch, then warp reduction to
     // one value, then sync, then everyone reads it and returns y[i] < 0.0
@@ -439,11 +528,12 @@ __device__ bool keepSearching(const typename SparseMatrix<T>::View &m,
     // self.i = np.argmin(delta)
 
     // return delta[self.i] < 0.0
+    return false;
 }
 
 template <typename T>
-__device__ void updateXY(const typename SparseMatrix<T>::View &m,
-                         std::span<uint32_t> x, std::span<T> y) {
+__device__ void updateXY(const typename SparseMatrix<T>::View &m, BitVector x,
+                         std::span<T> y) {
     // # sq is a sparse array
     // begin = sq.indptr[i]
     // end = sq.indptr[i + 1]
@@ -461,23 +551,21 @@ __device__ void updateXY(const typename SparseMatrix<T>::View &m,
 }
 
 template <typename T, typename Op>
-__device__ T updateMinimum(std::span<uint32_t> x, std::span<uint32_t> min_x,
-                           std::span<T> y, T min_y, std::span<T> scratch, Op op,
-                           T initial) {
+__device__ T updateMinimum(BitVector &x, BitVector &min_x, std::span<T> y,
+                           T min_y, std::span<T> scratch, Op op, T initial) {
     auto result = blockReduce(y, scratch, op, initial);
     if (result < min_y) {
         min_y = result;
-        for (size_t i = threadIdx.x; i < x.size(); i += blockDim.x) {
-            min_x[i] = x[i];
-        }
+        // TODO: make sure this works
+        std::swap(x, min_x);
     }
     return min_y;
 }
 
 template <typename T>
-__device__ T blockSearch(const typename SparseMatrix<T>::View &m,
-                         std::span<uint32_t> x, std::span<uint32_t> min_x,
-                         std::span<T> y, T min_y, std::span<T> scratch) {
+__device__ T blockSearch(const typename SparseMatrix<T>::View &m, BitVector &x,
+                         BitVector &min_x, std::span<T> y, T min_y,
+                         std::span<T> scratch) {
     generateRandomX(x);
     mx(m, x, y);
 
@@ -489,32 +577,26 @@ __device__ T blockSearch(const typename SparseMatrix<T>::View &m,
         x, mx, y, min_y, scratch, [](auto a, auto b) { return a + b; }, 0);
 }
 
-// TODO: compute x_values_per_block outside on the CPU:
-// num_cols / bit_width_of_x + 1, these should also be aligned nicely per block
-
-// TODO structure that gives correctly aligned sub spans per block:
-// - it has a single span
-// - it takes care of alignment per block
-// - does not handle the memory, just has a span, which it splits according to
-// some rule
-// TODO structure for the bit packed vector
-// - contains a span of some data
-// - has operator[](uint32_t i) -> returns the correct bit, maybe cast to T
 template <typename T>
-__global__ void search(const typename SparseMatrix<T>::View &m,
-                       std::span<uint32_t> min_x, std::span<T> y,
-                       std::span<T> min_y, uint32_t x_values_per_block,
-                       uint32_t num_values_to_search, bool use_shared_y) {
-    // TODO: needs dynamic memory of sizeof(T) * blockDim.x / warpSize
-    extern __shared__ std::byte shared_mem[];
-
-    std::span<T> scratch(static_cast<T *>(static_cast<void *>(shared_mem)),
-                         gpu::numWarpsInBlock());
-
-    const auto num_rows = m.shape().first;
+__device__ void search(const typename SparseMatrix<T>::View &m,
+                       std::span<T> block_y, SuperSpan<uint32_t> min_x,
+                       std::span<T> min_y, std::span<std::byte> shared_mem,
+                       uint32_t num_values_to_search) {
+    // TODO can this be made to a testable function?
+    // Construct bit vectors for x and minimum x in shared memory
     const auto num_cols = m.shape().second;
+    using S = typename BitVector::S;
+    const auto len_x = min_x.subspanLength();
+    BitVector block_x(
+        num_cols,
+        std::span<S>(static_cast<S *>(static_cast<void *>(shared_mem.data())),
+                     len_x));
+    BitVector block_min_x(num_cols, std::span<S>(block_x.span().end(), len_x));
 
-    // TODO: need to create spans etc.
+    // TODO: maybe alignment?
+    std::span<T> scratch(static_cast<T *>(static_cast<void *>(
+                             block_min_x.span().data() + len_x)),
+                         gpu::numWarpsInBlock());
 
     auto minimum_y = static_cast<T>(INFINITY);
     for (uint32_t bid = blockIdx.x; bid < num_values_to_search;
@@ -523,9 +605,50 @@ __global__ void search(const typename SparseMatrix<T>::View &m,
             blockSearch(m, block_x, block_min_x, block_y, minimum_y, scratch);
     }
 
+    // Copy the minimum found by the block from shared memory to global memory
+    auto bmx = min_x.subspan(blockIdx.x);
+    auto bmx_shared = block_min_x.span();
+    for (uint32_t tid = threadIdx.x; tid < bmx.size(); tid += blockDim.x) {
+        bmx[tid] = bmx_shared[tid];
+    }
+
+    // Update the minimum_y found by the block from register to global memory
     if (0 == threadIdx.x) {
         min_y[blockIdx.x] = minimum_y;
     }
+}
+
+template <typename T>
+__global__ void searchKernel(const typename SparseMatrix<T>::View &m,
+                             SuperSpan<T> y, SuperSpan<uint32_t> min_x,
+                             std::span<T> min_y, size_t shared_mem_bytes,
+                             uint32_t num_values_to_search) {
+    extern __shared__ std::byte shared_mem[];
+    auto block_y = y.subspan(blockIdx.x);
+    search(m, block_y, min_x, min_y,
+           std::span<std::byte>(shared_mem, shared_mem_bytes),
+           num_values_to_search);
+}
+
+template <typename T>
+__global__ void searchKernel(const typename SparseMatrix<T>::View &m,
+                             SuperSpan<uint32_t> min_x, std::span<T> min_y,
+                             size_t shared_mem_bytes,
+                             uint32_t num_values_to_search) {
+    extern __shared__ std::byte shared_mem[];
+
+    // Construct y in shared memory
+    std::span<T> block_y(static_cast<T *>(static_cast<void *>(shared_mem)),
+                         m.shape().second);
+
+    // TODO: maybe align these correctly
+    // The remainder of the shared memory is passed on
+    const auto ptr = static_cast<std::byte *>(
+        static_cast<void *>(block_y.data() + block_y.size()));
+    const auto bytes = shared_mem_bytes - block_y.size_bytes();
+
+    search(m, block_y, min_x, min_y, std::span<std::byte>(ptr, bytes),
+           num_values_to_search);
 }
 
 namespace testing {
