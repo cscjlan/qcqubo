@@ -8,3 +8,5 @@ CompileFlags:
     - -I/opt/rocm/include
     - -D__HIP_PLATFORM_AMD__
     - -xhip
+    - std=c++20
+    - Isrc
