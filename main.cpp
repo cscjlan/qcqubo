@@ -1,4 +1,5 @@
 #include <cassert>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -16,6 +17,24 @@
 
 // Here we have generic GPU related boilerplate
 namespace gpu {
+// clang-format off
+#if defined(__NVCC__) || (defined(__clang__) && defined(__CUDA__))
+    static constexpr uint32_t WARP_SIZE = 32ul;
+    static constexpr uint32_t WARP_SIZE_BASE_TWO = 5ul;
+#elif defined(__HIPCC__)
+    static constexpr uint32_t WARP_SIZE = 64ul;
+    static constexpr uint32_t WARP_SIZE_BASE_TWO = 6ul;
+#endif
+// clang-format on
+
+__device__ uint32_t laneID() { return threadIdx.x & (WARP_SIZE - 1); }
+
+__device__ uint32_t warpID() { return threadIdx.x >> WARP_SIZE_BASE_TWO; }
+
+__device__ uint32_t numWarpsInBlock() {
+    return max(blockDim.x >> WARP_SIZE_BASE_TWO, 1);
+}
+
 inline void hip_errchk(hipError_t result, const char *file, int32_t line) {
     if (result != hipSuccess) {
         std::printf("\n\n%s in %s at line %d\n", hipGetErrorString(result),
@@ -172,16 +191,28 @@ inline uint32_t warpSize() {
     return value;
 }
 
-template <typename T, typename Op> __device__ T warpReduction(T value, Op op) {
-    uint32_t n = ::warpSize >> 1u;
-    while (n > 0) {
-        value = op(value, __shfl_down(value, n));
-        n >>= 1;
+template <typename T, typename Op> __device__ T warpReduce(T value, Op op) {
+    value = op(value, __shfl_down(value, WARP_SIZE >> 1u));
+    value = op(value, __shfl_down(value, WARP_SIZE >> 2u));
+    value = op(value, __shfl_down(value, WARP_SIZE >> 3u));
+    value = op(value, __shfl_down(value, WARP_SIZE >> 4u));
+    value = op(value, __shfl_down(value, WARP_SIZE >> 5u));
+    if constexpr ((WARP_SIZE >> 6ul) > 0ul) {
+        value = op(value, __shfl_down(value, WARP_SIZE >> 6u));
     }
 
     return value;
 }
 } // namespace gpu
+
+template <uint32_t NUM, uint32_t POW>
+__device__ consteval uint32_t asPowOfTwo() {
+    if constexpr ((NUM >> POW) > 1) {
+        return asPowOfTwo<NUM, POW + 1>();
+    }
+
+    return POW;
+}
 
 // This only supporst square matrices
 template <typename T> struct SparseMatrix {
@@ -306,6 +337,198 @@ template <typename T> struct SparseMatrix {
     }
 };
 
+// TODO: test
+template <typename T>
+__device__ void mx(const typename SparseMatrix<T>::View &m,
+                   std::span<uint32_t> x, std::span<T> y) {
+    constexpr static uint32_t bits_per_x = 8 * sizeof(decltype(x[0]));
+
+    // TODO check this is correct length for x
+    assert(m.shape().first == y.size());
+    assert(m.shape().second == bits_per_x * x.size());
+
+    const uint32_t wid = gpu::warpID();
+    const uint32_t wstride = gpu::numWarpsInBlock();
+    const uint32_t lane = gpu::laneID();
+    const uint32_t lanestride =
+        gpu::WARP_SIZE < blockDim.x ? gpu::WARP_SIZE : blockDim.x;
+
+    // TODO: unpacking bits should/could be done in a function
+    for (auto row = wid; row < m.shape().first; row += wstride) {
+        const auto row_indices = m.rowIndices(row);
+        const auto row_data = m.rowData(row);
+        auto sum = static_cast<T>(0);
+        for (auto i = lane; i < row_indices.size(); i += lanestride) {
+            // j is the column of the matrix
+            const auto j = row_indices[i];
+            // x_id is the index to the x vector, with multiple bits per x
+            const auto x_id = j >> asPowOfTwo<bits_per_x, 0>();
+            // bit_id contains the correct bit from the fetched x value
+            const auto bit_id = j & (bits_per_x - 1);
+            // Finally, perform a product between the matrix value at (row, j)
+            // and the bit j in the bit vector
+            sum += row_data[i] * (x[x_id] >> bit_id) & 1;
+        }
+
+        // Only thread 0 gets the correct value
+        sum = gpu::warpReduce(sum, [](auto a, auto b) { return a + b; });
+        if (lane == 0) {
+            y[row] = sum;
+        }
+    }
+
+    // Warps work independently, but entire block may use the result
+    // sync all threads, so all threads see the results
+    __syncthreads();
+}
+
+__device__ void generateRandomX(std::span<uint32_t> x) {
+    // TODO
+}
+
+// TODO: test
+template <typename T, typename Op>
+__device__ T blockReduce(std::span<T> data, std::span<T> scratch, Op op,
+                         T initial) {
+    // When calling with multiple blocks, data and scratch must be unique per
+    // block
+    T result = initial;
+    for (size_t i = threadIdx.x; i < data.size(); i += blockDim.x) {
+        result = op(result, data[i]);
+    }
+
+    const uint32_t wid = gpu::warpID();
+    const uint32_t lane = gpu::laneID();
+
+    result = gpu::warpReduce(result, op);
+    if (0 == lane) {
+        scratch[wid] = result;
+    }
+
+    // Wait until all warps in block are done
+    __syncthreads();
+
+    // Perform the final reduction by the first warp
+    if (wid == 0) {
+        result = lane < gpu::numWarpsInBlock() ? scratch[lane] : initial;
+        result = gpu::warpReduce(result, op);
+
+        // First thread stores the result in memory accessible to the entire
+        // block
+        if (0 == lane) {
+            scratch[0] = result;
+        }
+    }
+
+    // Others wait until first warp is done
+    __syncthreads();
+
+    // Everyone returns the same value from scratch memory
+    return scratch[0];
+}
+
+template <typename T>
+__device__ bool keepSearching(const typename SparseMatrix<T>::View &m,
+                              std::span<uint32_t> x, std::span<T> y,
+                              std::span<T> scratch) {
+    // do the computations, then recudction to scratch, then warp reduction to
+    // one value, then sync, then everyone reads it and returns y[i] < 0.0
+    //
+    // sign = -2 * candidate.x + 1
+    // delta = sign * (2.0 * candidate.energies + sign * self.diagonal)
+    // self.i = np.argmin(delta)
+
+    // return delta[self.i] < 0.0
+}
+
+template <typename T>
+__device__ void updateXY(const typename SparseMatrix<T>::View &m,
+                         std::span<uint32_t> x, std::span<T> y) {
+    // # sq is a sparse array
+    // begin = sq.indptr[i]
+    // end = sq.indptr[i + 1]
+
+    // row_indices = sq.indices[begin:end]
+    // row_data = sq.data[begin:end]
+
+    // # Update energies for rows
+    // delta = row_data * (-2 * self.x[i] + 1)
+    // self.energies[row_indices] += delta
+
+    // # Flip bit i
+    //  this can be done by thread 0, then everyone syncs
+    // self.x[i] = abs(self.x[i] - 1)
+}
+
+template <typename T, typename Op>
+__device__ T updateMinimum(std::span<uint32_t> x, std::span<uint32_t> min_x,
+                           std::span<T> y, T min_y, std::span<T> scratch, Op op,
+                           T initial) {
+    auto result = blockReduce(y, scratch, op, initial);
+    if (result < min_y) {
+        min_y = result;
+        for (size_t i = threadIdx.x; i < x.size(); i += blockDim.x) {
+            min_x[i] = x[i];
+        }
+    }
+    return min_y;
+}
+
+template <typename T>
+__device__ T blockSearch(const typename SparseMatrix<T>::View &m,
+                         std::span<uint32_t> x, std::span<uint32_t> min_x,
+                         std::span<T> y, T min_y, std::span<T> scratch) {
+    generateRandomX(x);
+    mx(m, x, y);
+
+    while (keepSearching(m, x, y, scratch)) {
+        updateXY(m, x, y);
+    }
+
+    return updateMinimum(
+        x, mx, y, min_y, scratch, [](auto a, auto b) { return a + b; }, 0);
+}
+
+// TODO: compute x_values_per_block outside on the CPU:
+// num_cols / bit_width_of_x + 1, these should also be aligned nicely per block
+
+// TODO structure that gives correctly aligned sub spans per block:
+// - it has a single span
+// - it takes care of alignment per block
+// - does not handle the memory, just has a span, which it splits according to
+// some rule
+// TODO structure for the bit packed vector
+// - contains a span of some data
+// - has operator[](uint32_t i) -> returns the correct bit, maybe cast to T
+template <typename T>
+__global__ void search(const typename SparseMatrix<T>::View &m,
+                       std::span<uint32_t> min_x, std::span<T> y,
+                       std::span<T> min_y, uint32_t x_values_per_block,
+                       uint32_t num_values_to_search, bool use_shared_y) {
+    // TODO: needs dynamic memory of sizeof(T) * blockDim.x / warpSize
+    extern __shared__ std::byte shared_mem[];
+
+    std::span<T> scratch(static_cast<T *>(static_cast<void *>(shared_mem)),
+                         gpu::numWarpsInBlock());
+
+    const auto num_rows = m.shape().first;
+    const auto num_cols = m.shape().second;
+
+    // TODO: need to create spans etc.
+
+    auto minimum_y = static_cast<T>(INFINITY);
+    for (uint32_t bid = blockIdx.x; bid < num_values_to_search;
+         bid += gridDim.x) {
+        minimum_y =
+            blockSearch(m, block_x, block_min_x, block_y, minimum_y, scratch);
+    }
+
+    if (0 == threadIdx.x) {
+        min_y[blockIdx.x] = minimum_y;
+    }
+}
+
+namespace testing {
 template <typename T>
 __device__ void matrixProductPerBlock(const typename SparseMatrix<T>::View &m,
                                       std::span<T> x, std::span<T> y) {
@@ -314,11 +537,11 @@ __device__ void matrixProductPerBlock(const typename SparseMatrix<T>::View &m,
     assert(m.shape().first == y.size());
     assert(m.shape().second == x.size());
 
-    const uint32_t warp_size_base_2 = 5 + (warpSize >> 6);
-    const uint32_t wid = threadIdx.x >> warp_size_base_2;
-    const uint32_t wstride = max(blockDim.x >> warp_size_base_2, 1);
-    const uint32_t lane = threadIdx.x & (warpSize - 1);
-    const uint32_t lanestride = warpSize < blockDim.x ? warpSize : blockDim.x;
+    const uint32_t wid = gpu::warpID();
+    const uint32_t wstride = gpu::numWarpsInBlock();
+    const uint32_t lane = gpu::laneID();
+    const uint32_t lanestride =
+        gpu::WARP_SIZE < blockDim.x ? gpu::WARP_SIZE : blockDim.x;
 
     for (auto row = wid; row < m.shape().first; row += wstride) {
         const auto row_indices = m.rowIndices(row);
@@ -328,7 +551,7 @@ __device__ void matrixProductPerBlock(const typename SparseMatrix<T>::View &m,
             sum += row_data[i] * x[row_indices[i]];
         }
 
-        sum = gpu::warpReduction(sum, [](auto a, auto b) { return a + b; });
+        sum = gpu::warpReduce(sum, [](auto a, auto b) { return a + b; });
         if (lane == 0) {
             y[row] = sum;
         }
@@ -396,7 +619,7 @@ void testMatrixProduct() {
 template <typename T, typename Op>
 __global__ void warpReductionKernel(std::span<T> values, Op op) {
     auto value = threadIdx.x < values.size() ? values[threadIdx.x] : 0;
-    value = gpu::warpReduction(value, op);
+    value = gpu::warpReduce(value, op);
     if (threadIdx.x == 0) {
         values[0] = value;
     }
@@ -480,146 +703,20 @@ void testWarpReduction() {
     gpu::free(mem);
 }
 
-template <typename T>
-__device__ void mx(const typename SparseMatrix<T>::View &m,
-                   std::span<uint32_t> x, std::span<T> y) {
-    constexpr static uint32_t values_per_x = 8 * sizeof(decltype(x[0]));
-    // This assumes 32 or 64 bit values
-    constexpr static uint32_t x_size_base_2 = 5 + (values_per_x >> 6);
-
-    assert(m.shape().first == y.size());
-    assert(m.shape().second == values_per_x * x.size());
-
-    const uint32_t warp_size_base_2 = 5 + (warpSize >> 6);
-    const uint32_t wid = threadIdx.x >> warp_size_base_2;
-    const uint32_t wstride = max(blockDim.x >> warp_size_base_2, 1);
-    const uint32_t lane = threadIdx.x & (warpSize - 1);
-    const uint32_t lanestride = warpSize < blockDim.x ? warpSize : blockDim.x;
-
-    for (auto row = wid; row < m.shape().first; row += wstride) {
-        const auto row_indices = m.rowIndices(row);
-        const auto row_data = m.rowData(row);
-        auto sum = static_cast<T>(0);
-        for (auto i = lane; i < row_indices.size(); i += lanestride) {
-            // j is the column of the matrix
-            const auto j = row_indices[i];
-            // x_id is the index to the x vector, with multiple bits per x
-            const auto x_id = j >> x_size_base_2;
-            // bit_id contains the correct bit from the fetched x value
-            const auto bit_id = j & (values_per_x - 1);
-            // Finally, perform a product between the matrix value at (row, j)
-            // and the bit j in the bit vector
-            sum += row_data[i] * (x[x_id] >> bit_id) & 1;
-        }
-
-        sum = gpu::warpReduction(sum, [](auto a, auto b) { return a + b; });
-        if (lane == 0) {
-            y[row] = sum;
-        }
-    }
-}
-
-__device__ void generateRandomX(std::span<uint32_t> x) {
-    // TODO
-}
-
-template <typename T>
-__device__ bool keepSearching(const typename SparseMatrix<T>::View &m,
-                              std::span<uint32_t> x, std::span<T> y,
-                              std::span<uint32_t> scratch) {
-    // do the computations, then recudction to scratch, then warp reduction to
-    // one value, then sync, then everyone reads it and returns y[i] < 0.0
-    //
-    // sign = -2 * candidate.x + 1
-    // delta = sign * (2.0 * candidate.energies + sign * self.diagonal)
-    // self.i = np.argmin(delta)
-
-    // return delta[self.i] < 0.0
-}
-
-template <typename T>
-__device__ void updateXY(const typename SparseMatrix<T>::View &m,
-                         std::span<uint32_t> x, std::span<T> y) {
-    // # sq is a sparse array
-    // begin = sq.indptr[i]
-    // end = sq.indptr[i + 1]
-
-    // row_indices = sq.indices[begin:end]
-    // row_data = sq.data[begin:end]
-
-    // # Update energies for rows
-    // delta = row_data * (-2 * self.x[i] + 1)
-    // self.energies[row_indices] += delta
-
-    // # Flip bit i
-    //  this can be done by thread 0, then everyone syncs
-    // self.x[i] = abs(self.x[i] - 1)
-}
-
-template <typename T>
-__global__ void search(typename SparseMatrix<T>::View m, std::span<uint32_t> x,
-                       std::span<uint32_t> min_x, std::span<T> y,
-                       std::span<T> min_y, uint32_t num_values_to_search) {
-    // TODO: needs dynamic memory of sizeof(uint32_t) * blockDim.x / warpSize
-    extern __shared__ uint32_t scratch[];
-
-    const auto num_rows = m.shape().first;
-    const auto num_cols = m.shape().second;
-
-    constexpr static uint32_t values_per_x = 8 * sizeof(decltype(x[0]));
-    assert(values_per_x * x.size() == num_cols * gridDim.x);
-    assert(values_per_x * min_x.size() == num_cols * gridDim.x);
-    assert(y.size() == num_cols * gridDim.x);
-    // Only one value per block in min_y
-    assert(min_y.size() == gridDim.x);
-
-    const auto begin = blockIdx.x * num_cols;
-    const auto end = begin + num_cols;
-
-    // Make spans for each block
-    std::span<uint32_t> bx(x.data() + begin, x.data() + end);
-    std::span<uint32_t> bmx(min_x.data() + begin, min_x.data() + end);
-    std::span<T> by(y.data() + begin, y.data() + end);
-
-    for (uint32_t bid = blockIdx.x; bid < num_values_to_search;
-         bid += gridDim.x) {
-        generateRandomX(bx);
-        mx(m, bx, by);
-
-        // The previous does a warp reduction, here we'll work on the reduced
-        // values
-        __syncthreads();
-
-        while (
-            keepSearching(m, bx, by, std::span<uint32_t>(scratch, warpSize))) {
-            updateXY(m, bx, by);
-        }
-        // We've reached a local minimum
-        // Reduce the y to a single value
-        // Then compare to minimum_y by the entire block
-        // if smaller, every thread swaps bx to bmx, so the x is stored in the
-        // other if smaller, thread 0 updates min_y[blockIdx.x] to the computed
-        // y
-    }
-
-    // We've done the computation for this block,
-    // next we may need to do a final copy:
-    // if bx is the same pointer as x, we do no copy, as the minimum will be in
-    // bmx otherwise, we'll do a copy from bx to bmx
-}
+} // namespace testing
 
 int main() {
     std::printf("Test matrix product\n");
     std::fflush(stdout);
-    testMatrixProduct();
+    testing::testMatrixProduct();
 
     std::printf("test sparse matrix\n");
     std::fflush(stdout);
-    testSparseMatrix();
+    testing::testSparseMatrix();
 
     std::printf("test warp reduction\n");
     std::fflush(stdout);
-    testWarpReduction();
+    testing::testWarpReduction();
 
     gpu::synchronize();
 }
