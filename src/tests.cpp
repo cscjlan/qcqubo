@@ -14,9 +14,9 @@ __device__ void matrixProductPerBlock(const typename SparseMatrix<T>::View &m,
     assert(m.shape().first == y.size());
     assert(m.shape().second == x.size());
 
-    const uint32_t wid = gpu::warpID();
-    const uint32_t wstride = gpu::numWarpsInBlock();
-    const uint32_t lane = gpu::laneID();
+    const uint32_t wid = gpu::warpid();
+    const uint32_t wstride = gpu::nwarps();
+    const uint32_t lane = gpu::laneid();
     const uint32_t lanestride =
         gpu::WARP_SIZE < blockDim.x ? gpu::WARP_SIZE : blockDim.x;
 

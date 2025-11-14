@@ -11,27 +11,46 @@
 
 // Here we have generic GPU related boilerplate
 namespace gpu {
-// clang-format off
 #if defined(__NVCC__) || (defined(__clang__) && defined(__CUDA__))
-    static constexpr uint32_t WARP_SIZE = 32ul;
-    static constexpr uint32_t WARP_SIZE_BASE_TWO = 5ul;
+static constexpr uint32_t WARP_SIZE = 32ul;
+static constexpr uint32_t WARP_SIZE_BASE_TWO = 5ul;
 #elif defined(__HIPCC__)
-    static constexpr uint32_t WARP_SIZE = 64ul;
-    static constexpr uint32_t WARP_SIZE_BASE_TWO = 6ul;
+static constexpr uint32_t WARP_SIZE = 64ul;
+static constexpr uint32_t WARP_SIZE_BASE_TWO = 6ul;
 #endif
-// clang-format on
 
-    __forceinline__ __device__ uint32_t laneID() {
-        return threadIdx.x & (WARP_SIZE - 1);
-    }
+__forceinline__ __device__ uint32_t nblocks() { return gridDim.x; }
+__forceinline__ __device__ uint32_t nthreads() { return blockDim.x; }
+__forceinline__ __device__ uint32_t nwarps() {
+    return max(nthreads() >> WARP_SIZE_BASE_TWO, 1);
+}
+__forceinline__ __device__ uint32_t nlanes() {
+    return min(nthreads(), WARP_SIZE);
+}
 
-    __forceinline__ __device__ uint32_t warpID() {
-        return threadIdx.x >> WARP_SIZE_BASE_TWO;
-    }
+__forceinline__ __device__ uint32_t blockid() { return blockIdx.x; }
+__forceinline__ __device__ uint32_t threadid() { return threadIdx.x; }
+__forceinline__ __device__ uint32_t warpid() {
+    return threadIdx.x >> WARP_SIZE_BASE_TWO;
+}
+__forceinline__ __device__ uint32_t laneid() {
+    return threadIdx.x & (WARP_SIZE - 1);
+}
 
-    __forceinline__ __device__ uint32_t numWarpsInBlock() {
-        return max(blockDim.x >> WARP_SIZE_BASE_TWO, 1);
-    }
+__forceinline__ __device__ void syncthreads() { __syncthreads(); }
+
+// These are for testing the code serially on the CPU
+__forceinline__ __host__ uint32_t nblocks() { return 1; }
+__forceinline__ __host__ uint32_t nthreads() { return 1; }
+__forceinline__ __host__ uint32_t nwarps() { return 1; }
+__forceinline__ __host__ uint32_t nlanes() { return 1; }
+
+__forceinline__ __host__ uint32_t blockid() { return 0; }
+__forceinline__ __host__ uint32_t threadid() { return 0; }
+__forceinline__ __host__ uint32_t warpid() { return 0; }
+__forceinline__ __host__ uint32_t laneid() { return 0; }
+
+__forceinline__ __host__ void syncthreads() {}
 
 inline void hip_errchk(hipError_t result, const char *file, int32_t line) {
     if (result != hipSuccess) {
@@ -201,4 +220,32 @@ template <typename T, typename Op> __device__ T warpReduce(T value, Op op) {
 
     return value;
 }
+
+// The single threads serial host code just passes the value back
+template <typename T, typename Op> __host__ T warpReduce(T value, Op) {
+    return value;
+}
+
+template <typename T, typename U, typename Op>
+__device__ std::pair<T, U> warpArgSearch(T t, U u, Op op) {
+    // We want the value of u from the lane that has the minimum value of t
+    const uint32_t lane = gpu::laneid();
+    uint32_t minlane = lane;
+    uint32_t delta = gpu::WARP_SIZE >> 1u;
+    while (delta > 0ul) {
+        std::tie(t, minlane) =
+            op(__shfl_down(t, delta), t, lane + delta, minlane);
+        delta >>= 1u;
+    }
+
+    // Get the u from the lane with the minimum to lane 0
+    u = __shfl_down(u, minlane);
+    return std::make_pair(t, u);
+};
+
+template <typename T, typename U, typename Op>
+__host__ std::pair<T, U> warpArgSearch(T t, U u, Op) {
+    // Host with one thread just passes the values
+    return std::make_pair(t, u);
+};
 } // namespace gpu
