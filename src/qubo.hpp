@@ -23,7 +23,65 @@ __host__ __device__ consteval uint32_t asPowOfTwo() {
 }
 
 // This only supports square matrices
-template <typename T> struct SparseMatrix {
+template <typename T> struct View {
+  private:
+    std::span<uint32_t> indptr;
+    std::span<uint32_t> indices;
+    std::span<T> data;
+
+  public:
+    std::span<T> diagonal;
+
+    View() {}
+    View(std::span<uint32_t> ip, std::span<uint32_t> in, std::span<T> da,
+         std::span<T> di)
+        : indptr(ip), indices(in), data(da), diagonal(di) {}
+
+    __host__ __device__ std::span<uint32_t> rowIndices(uint32_t r) const {
+        assert(r + 1 < indptr.size());
+        const auto begin = indptr[r];
+        const auto end = indptr[r + 1];
+        return std::span<uint32_t>(&indices[begin], end - begin);
+    }
+
+    __host__ __device__ std::span<T> rowData(uint32_t r) const {
+        assert(r + 1 < indptr.size());
+        const auto begin = indptr[r];
+        const auto end = indptr[r + 1];
+        return std::span<T>(&data[begin], end - begin);
+    }
+
+    __host__ __device__ std::pair<uint32_t, uint32_t> shape() const {
+        return std::make_pair(indptr.size() - 1, indptr.size() - 1);
+    }
+
+    __host__ std::vector<T> toDense() const {
+        const auto n = shape().first;
+        std::vector<uint32_t> indptr_h(indptr.size(), 0);
+        std::vector<uint32_t> indices_h(indices.size(), 0);
+        std::vector<T> data_h(data.size(), 0);
+
+        gpu::memcpy(indptr_h.data(), indptr.data(), indptr.size_bytes());
+        gpu::memcpy(indices_h.data(), indices.data(), indices.size_bytes());
+        gpu::memcpy(data_h.data(), data.data(), data.size_bytes());
+
+        std::vector<T> dense(n * n, 0);
+        for (auto i = 0; i < n; i++) {
+            const auto begin = indptr_h[i];
+            const auto end = indptr_h[i + 1];
+            const auto length = end - begin;
+            for (auto j = 0; j < length; j++) {
+                const auto index = i * n + indices_h[begin + j];
+                dense[index] = data_h[begin + j];
+            }
+        }
+
+        return dense;
+    }
+};
+
+// This only supports square matrices
+template <typename T, typename Mem> struct SparseMatrix {
     static size_t numBytesReq(size_t ndata, size_t nrows) {
         // Add one extra for alignment and nrows for the diagonal
         auto required = sizeof(T) * (ndata + 1 + nrows);
@@ -40,69 +98,15 @@ template <typename T> struct SparseMatrix {
 
   private:
     size_t num_bytes = 0ull;
-    std::unique_ptr<std::byte, decltype(&gpu::free)> memory;
+    std::unique_ptr<uint8_t, decltype(&Mem::free)> memory;
+    View<T> view;
 
   public:
-    struct View {
-        friend SparseMatrix<T>;
-
-      private:
-        std::span<uint32_t> indptr;
-        std::span<uint32_t> indices;
-        std::span<T> data;
-
-      public:
-        std::span<T> diagonal;
-
-        __host__ __device__ std::span<uint32_t> rowIndices(uint32_t r) const {
-            assert(r + 1 < indptr.size());
-            const auto begin = indptr[r];
-            const auto end = indptr[r + 1];
-            return std::span<uint32_t>(&indices[begin], end - begin);
-        }
-
-        __host__ __device__ std::span<T> rowData(uint32_t r) const {
-            assert(r + 1 < indptr.size());
-            const auto begin = indptr[r];
-            const auto end = indptr[r + 1];
-            return std::span<T>(&data[begin], end - begin);
-        }
-
-        __host__ __device__ std::pair<uint32_t, uint32_t> shape() const {
-            return std::make_pair(indptr.size() - 1, indptr.size() - 1);
-        }
-
-        __host__ std::vector<T> toDense() const {
-            const auto n = shape().first;
-            std::vector<uint32_t> indptr_h(indptr.size(), 0);
-            std::vector<uint32_t> indices_h(indices.size(), 0);
-            std::vector<T> data_h(data.size(), 0);
-
-            gpu::memcpy(indptr_h.data(), indptr.data(), indptr.size_bytes());
-            gpu::memcpy(indices_h.data(), indices.data(), indices.size_bytes());
-            gpu::memcpy(data_h.data(), data.data(), data.size_bytes());
-
-            std::vector<T> dense(n * n, 0);
-            for (auto i = 0; i < n; i++) {
-                const auto begin = indptr_h[i];
-                const auto end = indptr_h[i + 1];
-                const auto length = end - begin;
-                for (auto j = 0; j < length; j++) {
-                    const auto index = i * n + indices_h[begin + j];
-                    dense[index] = data_h[begin + j];
-                }
-            }
-
-            return dense;
-        }
-    } view;
-
     SparseMatrix(const std::vector<uint32_t> &indptr,
                  const std::vector<uint32_t> &indices,
                  const std::vector<T> &data)
         : num_bytes(numBytesReq(data.size(), indptr.size() - 1)),
-          memory(static_cast<std::byte *>(gpu::allocate(num_bytes)),
-                 gpu::free) {
+          memory(static_cast<uint8_t *>(Mem::allocate(num_bytes)), Mem::free) {
         std::vector<T> diagonal(indptr.size() - 1, 0);
         for (auto r = 0; r < indptr.size() - 1; r++) {
             const auto begin = indptr[r];
@@ -124,8 +128,8 @@ template <typename T> struct SparseMatrix {
             if (std::align(alignof(V), vec.size(), ptr, space)) {
                 auto span = std::span<V>(static_cast<V *>(ptr), vec.size());
                 uint32_t bytes = span.size_bytes();
-                gpu::memcpy(span.data(), vec.data(), bytes);
-                ptr = static_cast<std::byte *>(ptr) + bytes;
+                Mem::memcpy(span.data(), vec.data(), bytes);
+                ptr = static_cast<uint8_t *>(ptr) + bytes;
                 space -= bytes;
 
                 return span;
@@ -133,16 +137,20 @@ template <typename T> struct SparseMatrix {
             return std::span<V>(static_cast<V *>(ptr), 0);
         };
 
-        view.data = setSpan(data);
-        view.diagonal = setSpan(diagonal);
-        view.indices = setSpan(indices);
-        view.indptr = setSpan(indptr);
+        auto span_data = setSpan(data);
+        auto span_diagonal = setSpan(diagonal);
+        auto span_indices = setSpan(indices);
+        auto span_indptr = setSpan(indptr);
 
-        assert(view.data.size() == data.size());
-        assert(view.diagonal.size() == diagonal.size());
-        assert(view.indices.size() == indices.size());
-        assert(view.indptr.size() == indptr.size());
+        assert(span_data.size() == data.size());
+        assert(span_diagonal.size() == diagonal.size());
+        assert(span_indices.size() == indices.size());
+        assert(span_indptr.size() == indptr.size());
+
+        view = View(span_indptr, span_indices, span_data, span_diagonal);
     }
+
+    View<T> getView() const { return view; }
 };
 
 template <typename T> struct SuperSpan {
@@ -156,11 +164,6 @@ template <typename T> struct SuperSpan {
     uint32_t num_subspans = 0;
     uint32_t subspan_len = 0;
 
-    static uint32_t requiredLength(uint32_t num_subspans,
-                                   uint32_t subspan_len) {
-        return num_subspans * width(num_subspans, subspan_len);
-    }
-
     __host__ __device__ static uint32_t width(uint32_t num_subspans,
                                               uint32_t subspan_len) {
         // Compute the width of the subspan
@@ -172,6 +175,11 @@ template <typename T> struct SuperSpan {
     }
 
   public:
+    static uint32_t requiredLength(uint32_t num_subspans,
+                                   uint32_t subspan_len) {
+        return num_subspans * width(num_subspans, subspan_len);
+    }
+
     static uint32_t memReq(uint32_t num_subspans, uint32_t subspan_len) {
         return requiredLength(num_subspans, subspan_len) * sizeof(T);
     }
@@ -192,7 +200,7 @@ template <typename T> struct SuperSpan {
         // Are we inside the super span?
         assert(begin + subspan_len < data.size());
 
-        return std::span<T>(data.data() + begin, subspan_len);
+        return data.subspan(begin, subspan_len);
     }
 
     __host__ __device__ uint32_t subspanLength() const { return subspan_len; }
@@ -224,7 +232,8 @@ struct BitVector {
         return static_cast<size_t>(requiredLength(len)) * sizeof(S);
     }
 
-    template <typename T> __host__ __device__ T operator[](uint32_t i) const {
+    template <typename T = uint32_t>
+    __host__ __device__ T operator[](uint32_t i) const {
         // We should return the bit at index i
         // We'll unpack the correct value in data and return the correct bit
         // from that value
@@ -251,12 +260,13 @@ struct BitVector {
     __host__ __device__ size_t size() const { return len; }
 };
 
+// TODO: test everything below this
 void *alignPtr(void *ptr, size_t szof) {
     const auto misalignment =
         (szof - (reinterpret_cast<std::intptr_t>(ptr) & (szof - 1))) &
         (szof - 1);
 
-    return static_cast<std::byte *>(ptr) + misalignment;
+    return static_cast<uint8_t *>(ptr) + misalignment;
 };
 
 template <typename T> struct Scratch {
@@ -276,8 +286,8 @@ template <typename T> struct Scratch {
 };
 
 template <typename T>
-__host__ __device__ std::pair<std::span<T>, std::span<std::byte>>
-makeAlignedSpan(std::span<std::byte> data, uint32_t len) {
+__host__ __device__ std::pair<std::span<T>, std::span<uint8_t>>
+makeAlignedSpan(std::span<uint8_t> data, uint32_t len) {
     assert(data.size_bytes() >= sizeof(T) * len);
 
     auto ptr = alignPtr(data.data(), sizeof(T));
@@ -289,13 +299,11 @@ makeAlignedSpan(std::span<std::byte> data, uint32_t len) {
 
     return std::make_pair(
         aligned,
-        std::span<std::byte>(static_cast<std::byte *>(ptr), bytes_remaining));
+        std::span<uint8_t>(static_cast<uint8_t *>(ptr), bytes_remaining));
 }
 
-// TODO: test
 template <typename T>
-__host__ __device__ void mx(const typename SparseMatrix<T>::View &m,
-                            BitVector x, std::span<T> y) {
+__host__ __device__ void mx(const View<T> &m, BitVector x, std::span<T> y) {
     const auto shape = m.shape();
     const auto num_rows = shape.first;
     const auto num_cols = shape.second;
@@ -338,7 +346,6 @@ __host__ __device__ void generateRandomX(BitVector x) {
     }
 }
 
-// TODO: test
 template <typename T, typename Op>
 __host__ __device__ T blockReduce(std::span<T> data, Scratch<T> &scratch, Op op,
                                   T initial) {
@@ -384,9 +391,8 @@ __host__ __device__ T blockReduce(std::span<T> data, Scratch<T> &scratch, Op op,
 }
 
 template <typename T>
-__host__ __device__ int32_t minimumRow(const typename SparseMatrix<T>::View &m,
-                                       BitVector x, std::span<T> y,
-                                       Scratch<T> &scratch) {
+__host__ __device__ int32_t minimumRow(const View<T> &m, BitVector x,
+                                       std::span<T> y, Scratch<T> &scratch) {
     const auto diagonal = m.diagonal;
     T minimum = static_cast<T>(INFINITY);
     int32_t minrow = -1;
@@ -466,8 +472,8 @@ __host__ __device__ int32_t minimumRow(const typename SparseMatrix<T>::View &m,
 }
 
 template <typename T>
-__host__ __device__ void updateXY(const typename SparseMatrix<T>::View &m,
-                                  BitVector x, std::span<T> y, uint32_t row) {
+__host__ __device__ void updateXY(const View<T> &m, BitVector x, std::span<T> y,
+                                  uint32_t row) {
     auto data = m.rowData(row);
     auto indices = m.rowIndices(row);
     const T xi = x.operator[]<T>(row);
@@ -490,8 +496,7 @@ __host__ __device__ void updateXY(const typename SparseMatrix<T>::View &m,
 }
 
 template <typename T>
-__host__ __device__ T blockSearch(const typename SparseMatrix<T>::View &m,
-                                  BitVector x, std::span<T> y,
+__host__ __device__ T blockSearch(const View<T> &m, BitVector x, std::span<T> y,
                                   Scratch<T> &scratch) {
     generateRandomX(x);
     mx(m, x, y);
@@ -507,9 +512,9 @@ __host__ __device__ T blockSearch(const typename SparseMatrix<T>::View &m,
 }
 
 template <typename T>
-__host__ __device__ void search(const typename SparseMatrix<T>::View &m,
-                                std::span<T> block_y, SuperSpan<uint32_t> min_x,
-                                std::span<T> min_y, std::span<std::byte> mem,
+__host__ __device__ void search(const View<T> &m, std::span<T> block_y,
+                                SuperSpan<uint32_t> min_x, std::span<T> min_y,
+                                std::span<uint8_t> mem,
                                 uint32_t num_values_to_search) {
     // Construct bit vectors for x and minimum x
     const auto num_cols = m.shape().second;
@@ -556,28 +561,27 @@ __host__ __device__ void search(const typename SparseMatrix<T>::View &m,
 }
 
 template <typename T>
-__global__ void searchKernel(const typename SparseMatrix<T>::View &m,
-                             SuperSpan<T> y, SuperSpan<uint32_t> min_x,
-                             std::span<T> min_y, size_t shared_mem_bytes,
+__global__ void searchKernel(const View<T> &m, SuperSpan<T> y,
+                             SuperSpan<uint32_t> min_x, std::span<T> min_y,
+                             size_t shared_mem_bytes,
                              uint32_t num_values_to_search) {
-    extern __shared__ std::byte shared_mem[];
+    extern __shared__ uint8_t shared_mem[];
     // Use y from global memory
     auto block_y = y.subspan(gpu::blockid());
     search(m, block_y, min_x, min_y,
-           std::span<std::byte>(shared_mem, shared_mem_bytes),
+           std::span<uint8_t>(shared_mem, shared_mem_bytes),
            num_values_to_search);
 }
 
 template <typename T>
-__global__ void searchKernel(const typename SparseMatrix<T>::View &m,
-                             SuperSpan<uint32_t> min_x, std::span<T> min_y,
-                             size_t shared_mem_bytes,
+__global__ void searchKernel(const View<T> &m, SuperSpan<uint32_t> min_x,
+                             std::span<T> min_y, size_t shared_mem_bytes,
                              uint32_t num_values_to_search) {
-    extern __shared__ std::byte shared_mem[];
+    extern __shared__ uint8_t shared_mem[];
 
     // Construct y in shared memory
     auto [block_y, remainder] = makeAlignedSpan<T>(
-        std::span<std::byte>(shared_mem, shared_mem_bytes), m.shape().second);
+        std::span<uint8_t>(shared_mem, shared_mem_bytes), m.shape().second);
 
     search(m, block_y, min_x, min_y, remainder, num_values_to_search);
 }

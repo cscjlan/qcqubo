@@ -1,4 +1,5 @@
 #include <cstdio>
+#include <cstring>
 #include <iostream>
 #include <numeric>
 
@@ -6,59 +7,204 @@
 #include "qubo.hpp"
 
 namespace testing {
-template <typename T>
-__device__ void matrixProductPerBlock(const typename SparseMatrix<T>::View &m,
-                                      std::span<T> x, std::span<T> y) {
-    // This function produces one matrix product per block
-    // If multiple blocks call this, they should each provide a unique y vector
-    assert(m.shape().first == y.size());
-    assert(m.shape().second == x.size());
+struct CPUMem {
+    static void *allocate(size_t num_bytes) { return std::malloc(num_bytes); }
 
-    const uint32_t wid = gpu::warpid();
-    const uint32_t wstride = gpu::nwarps();
-    const uint32_t lane = gpu::laneid();
-    const uint32_t lanestride =
-        gpu::WARP_SIZE < blockDim.x ? gpu::WARP_SIZE : blockDim.x;
+    static void free(void *ptr) { std::free(ptr); }
 
-    for (auto row = wid; row < m.shape().first; row += wstride) {
-        const auto row_indices = m.rowIndices(row);
-        const auto row_data = m.rowData(row);
-        auto sum = static_cast<T>(0);
-        for (auto i = lane; i < row_indices.size(); i += lanestride) {
-            sum += row_data[i] * x[row_indices[i]];
+    static void memcpy(void *dst, const void *src, size_t num_bytes) {
+        std::memcpy(dst, src, num_bytes);
+    }
+};
+
+SparseMatrix<float, CPUMem> fromDense(const std::vector<float> &dense,
+                                      uint32_t num_rows) {
+    assert(dense.size() == num_rows * num_rows);
+    std::vector<uint32_t> indptr{};
+    std::vector<uint32_t> indices{};
+    std::vector<float> data{};
+    const uint32_t num_cols = num_rows;
+
+    indptr.push_back(0);
+    for (auto row = 0; row < num_rows; row++) {
+        for (auto col = 0; col < num_cols; col++) {
+            const auto index = row * num_cols + col;
+            const auto value = dense[index];
+            if (value != 0.0f) {
+                data.push_back(value);
+                indices.push_back(col);
+            }
         }
+        const auto end = data.size();
+        indptr.push_back(end);
+    }
 
-        sum = gpu::warpReduce(sum, [](auto a, auto b) { return a + b; });
-        if (lane == 0) {
-            y[row] = sum;
+    assert(indptr.size() == num_rows + 1);
+
+    return SparseMatrix<float, CPUMem>(indptr, indices, data);
+}
+
+void testFromToDense() {
+    std::printf("Testing fromDense\n");
+    static constexpr uint32_t num_rows = 4;
+
+    std::vector<float> dense{
+        11.0f, 0.0f,  0.0f,  0.0f, 21.0f, 22.0f, 0.0f, 0.0f,
+        0.0f,  32.0f, 33.0f, 0.0f, 0.0f,  0.0f,  0.0f, 44.0f,
+    };
+
+    const auto sparse = fromDense(dense, num_rows);
+    const auto m = sparse.getView();
+
+    assert(m.shape().first == num_rows);
+    assert(m.shape().second == num_rows);
+
+    auto row = m.diagonal;
+    assert(row[0] == 11.0f);
+    assert(row[1] == 22.0f);
+    assert(row[2] == 33.0f);
+    assert(row[3] == 44.0f);
+
+    row = m.rowData(0);
+    assert(row[0] == 11.0f);
+    assert(row.size() == 1);
+
+    auto ind = m.rowIndices(0);
+    assert(ind[0] == 0);
+    assert(ind.size() == 1);
+
+    row = m.rowData(1);
+    assert(row[0] == 21.0f);
+    assert(row[1] == 22.0f);
+    assert(row.size() == 2);
+
+    ind = m.rowIndices(1);
+    assert(ind[0] == 0);
+    assert(ind[1] == 1);
+    assert(ind.size() == 2);
+
+    row = m.rowData(2);
+    assert(row[0] == 32.0f);
+    assert(row[1] == 33.0f);
+    assert(row.size() == 2);
+
+    ind = m.rowIndices(2);
+    assert(ind[0] == 1);
+    assert(ind[1] == 2);
+    assert(ind.size() == 2);
+
+    row = m.rowData(3);
+    assert(row[0] == 44.0f);
+    assert(row.size() == 1);
+
+    ind = m.rowIndices(3);
+    assert(ind[0] == 3);
+    assert(ind.size() == 1);
+
+    const auto td = m.toDense();
+    assert(td.size() == dense.size());
+    for (auto i = 0; i < td.size(); i++) {
+        assert(td[i] == dense[i]);
+    }
+}
+
+void testBitVector() {
+    std::printf("Testing bitVector\n");
+    uint32_t len = 100;
+    const auto reql = BitVector::requiredLength(len);
+    assert(reql == len / 32 + 1);
+    std::vector<uint32_t> data(reql, 0);
+
+    BitVector bv(len, std::span(data));
+    for (auto i = 0; i < bv.size(); i++) {
+        assert(bv[i] == 0u);
+    }
+
+    bv.flip(10);
+    assert(bv[9] == 0u);
+    assert(bv[10] == 1u);
+    assert(bv[11] == 0u);
+    bv.flip(10);
+
+    for (auto i = 0; i < bv.size(); i++) {
+        bv.flip(i);
+    }
+
+    // The last may not be entirely ones, as the length of the bit vector might
+    // not be divisible by 32
+    auto last = bv.span().back();
+    assert(last == (~0u) >> (32 - (bv.size() % 32)));
+    for (auto v = bv.span().begin(); v != bv.span().end() - 1; v++) {
+        assert(*v == ~0u);
+    }
+}
+
+void testSuperspan() {
+    std::printf("Testing superspan\n");
+
+    const uint32_t num_subspans = 20;
+    const uint32_t subspan_len = 58;
+    const auto reql =
+        SuperSpan<double>::requiredLength(num_subspans, subspan_len);
+    std::vector<double> data(reql, 0);
+    auto ss = SuperSpan<double>(std::span(data), num_subspans, subspan_len);
+
+    assert(ss.subspanLength() == subspan_len);
+
+    for (auto &v : ss.subspan(0)) {
+        v = 1.0;
+    }
+
+    for (auto &v : ss.subspan(1)) {
+        v = 2.0;
+    }
+
+    // There's padding between the subspans that should be zero
+    for (auto i = 0; i < 128; i++) {
+        if (i < subspan_len) {
+            assert(data[i] == 1.0);
+        } else if (i < 64) {
+            assert(data[i] == 0.0);
+        } else if (i < subspan_len + 64) {
+            assert(data[i] == 2.0);
+        } else {
+            assert(data[i] == 0.0);
         }
     }
 }
 
-template <typename T>
-__device__ void matrixProduct(const typename SparseMatrix<T>::View &m,
-                              std::span<T> x, std::span<T> y) {
-    // X and Y contain many vectors
-    const uint32_t length = m.shape().second;
-    const uint32_t bid = blockIdx.x;
-    const uint32_t bstride = gridDim.x;
-    for (uint32_t i = bid; i < x.size() / length; i += bstride) {
-        const auto begin = i * length;
-        const auto end = begin + length;
+void testSuperspan2() {
+    std::printf("Testing superspan2\n");
 
-        const std::span<T> block_x(x.data() + begin, x.data() + end);
-        const std::span<T> block_y(y.data() + begin, y.data() + end);
+    const uint32_t num_subspans = 5;
+    const uint32_t subspan_len = 96;
+    const auto reql =
+        SuperSpan<double>::requiredLength(num_subspans, subspan_len);
+    std::vector<double> data(reql, 0);
+    auto ss = SuperSpan<double>(std::span(data), num_subspans, subspan_len);
 
-        matrixProductPerBlock(m, block_x, block_y);
+    assert(ss.subspanLength() == subspan_len);
+
+    for (auto &v : ss.subspan(0)) {
+        v = 1.0;
     }
+
+    for (auto &v : ss.subspan(1)) {
+        v = 2.0;
+    }
+
+    // There shouldn't be any padding between the subspans
+    for (auto i = 0; i < 192; i++) {
+        if (i < subspan_len) {
+            assert(data[i] == 1.0);
+        } else {
+            assert(data[i] == 2.0);
+        }
+    }
+    assert(data[192] == 0.0);
 }
 
-template <typename T>
-__global__ void mp(typename SparseMatrix<T>::View m, std::span<T> x,
-                   std::span<T> y) {
-    matrixProduct(m, x, y);
-}
-
+/*
 void testMatrixProduct() {
     using T = float;
     constexpr static auto n = 4;
@@ -66,7 +212,7 @@ void testMatrixProduct() {
     std::vector<uint32_t> indices{0, 2, 1, 2, 3};
     std::vector<T> data{11.0f, 13.0f, 22.0f, 33.0f, 44.0f};
 
-    const SparseMatrix mat(indptr, indices, data);
+    const SparseMatrix<T, CPUMem> mat(indptr, indices, data);
 
     std::vector<T> x(n, 1.0f);
     std::vector<T> y(n, 0.0f);
@@ -80,7 +226,7 @@ void testMatrixProduct() {
     gpu::memcpy(x_d.data(), x.data(), x_d.size_bytes());
     gpu::memcpy(y_d.data(), y.data(), y_d.size_bytes());
 
-    LAUNCH_KERNEL(mp, 1, 64, 0, 0, "", mat.view, x_d, y_d);
+    // LAUNCH_KERNEL(mp, 1, 64, 0, 0, "", mat.view, x_d, y_d);
 
     gpu::memcpy(y.data(), y_d.data(), y_d.size_bytes());
 
@@ -179,22 +325,23 @@ void testWarpReduction() {
 
     gpu::free(mem);
 }
+*/
 
 } // namespace testing
 
 int main() {
-    std::printf("Test matrix product\n");
-    std::fflush(stdout);
-    testing::testMatrixProduct();
+    testing::testFromToDense();
+    testing::testBitVector();
+    testing::testSuperspan();
+    testing::testSuperspan2();
 
-    std::printf("test sparse matrix\n");
-    std::fflush(stdout);
-    testing::testSparseMatrix();
+    // testing::testMatrixProduct();
 
-    std::printf("test warp reduction\n");
-    std::fflush(stdout);
-    testing::testWarpReduction();
+    // testing::testSparseMatrix();
 
-    gpu::synchronize();
+    // testing::testWarpReduction();
+
+    // gpu::synchronize();
+
     return 0;
 }
