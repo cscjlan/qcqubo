@@ -251,6 +251,30 @@ struct BitVector {
     size_t size() const { return len; }
 };
 
+template <typename T> struct Scratch {
+    T *values = nullptr;
+    uint32_t *indices = nullptr;
+    uint32_t len = 0ul;
+
+    __device__ __host__ Scratch(std::byte *ptr, uint32_t num_values) {
+        auto alignPtr = [&ptr](auto szof) {
+            const auto misalignment =
+                (szof - (reinterpret_cast<std::intptr_t>(ptr) & (szof - 1))) &
+                (szof - 1);
+
+            ptr += misalignment;
+        };
+
+        alignPtr(sizeof(T));
+        values = static_cast<T *>(static_cast<void *>(ptr));
+
+        alignPtr(sizeof(uint32_t));
+        indices = static_cast<uint32_t *>(static_cast<void *>(ptr));
+
+        len = num_values;
+    }
+};
+
 // TODO: test
 template <typename T>
 __device__ void mx(const typename SparseMatrix<T>::View &m, BitVector x,
@@ -290,12 +314,16 @@ __device__ void mx(const typename SparseMatrix<T>::View &m, BitVector x,
 }
 
 __device__ void generateRandomX(BitVector x) {
-    // TODO
+    // TODO use hiprand, here we're just assing around
+    auto span = x.span();
+    for (uint32_t i = threadIdx.x; i < span.size(); i += blockDim.x) {
+        span[i] = i;
+    }
 }
 
 // TODO: test
 template <typename T, typename Op>
-__device__ T blockReduce(std::span<T> data, std::span<T> scratch, Op op,
+__device__ T blockReduce(std::span<T> data, Scratch<T> &scratch, Op op,
                          T initial) {
     // When calling with multiple blocks, data and scratch must be unique per
     // block
@@ -309,7 +337,7 @@ __device__ T blockReduce(std::span<T> data, std::span<T> scratch, Op op,
 
     result = gpu::warpReduce(result, op);
     if (0 == lane) {
-        scratch[wid] = result;
+        scratch.values[wid] = result;
     }
 
     // Wait until all warps in block are done
@@ -317,55 +345,121 @@ __device__ T blockReduce(std::span<T> data, std::span<T> scratch, Op op,
 
     // Perform the final reduction by the first warp
     if (wid == 0) {
-        result = lane < gpu::numWarpsInBlock() ? scratch[lane] : initial;
+        result = lane < gpu::numWarpsInBlock() ? scratch.values[lane] : initial;
         result = gpu::warpReduce(result, op);
 
         // First thread stores the result in memory accessible to the entire
         // block
         if (0 == lane) {
-            scratch[0] = result;
+            scratch.values[0] = result;
         }
     }
 
     // Others wait until first warp is done
     __syncthreads();
 
-    // Everyone returns the same value from scratch memory
-    return scratch[0];
+    result = scratch.values[0];
+
+    // Everyone waits until everyone has read the value
+    __syncthreads();
+
+    return result;
 }
 
 template <typename T>
 __device__ int32_t minimumRow(const typename SparseMatrix<T>::View &m,
                               BitVector x, std::span<T> y,
-                              std::span<T> scratch) {
-    // do the computations, then recudction to scratch, then warp reduction to
-    // one value, then sync, then everyone reads it and returns y[i] < 0.0
-    //
-    // sign = -2 * candidate.x + 1
-    // delta = sign * (2.0 * candidate.energies + sign * self.diagonal)
-    // self.i = np.argmin(delta)
-
-    // return delta[self.i] < 0.0
-
+                              Scratch<T> &scratch) {
     const auto diagonal = m.diagonal;
     T minimum = static_cast<T>(INFINITY);
-    auto min_i = -1;
+    int32_t minrow = -1;
 
-    for (size_t i = threadIdx.x; i < y.size(); i += blockDim.x) {
+    auto updatedRowValue = [&x, &y, &diagonal](auto i) {
         static constexpr T one = static_cast<T>(1.0);
         static constexpr T two = static_cast<T>(2.0);
+
+        // If current x is zero, flipping it to 1 adds to the total, so positive
+        // sign Conversely for x == 1
         const auto sign = -two * x.operator[]<T>(i) + one;
+
+        // y may or may not contain the diagonal
+        // 2*y contains the diagonal either twice or zero times
+        // subtracting or adding the diagonal to y once will leave 2*y with
+        // the diagonal exactly once
         const auto value = sign * (two * y[i] + sign * diagonal[i]);
-        if (value < minimum) {
-            minimum = value;
-            min_i = i;
+
+        return value;
+    };
+
+    // This updates the minimum internally and returns the index corresponding
+    // to that minimum
+    auto argmin = [&minimum](auto a, auto i, auto j) {
+        auto interpolate = [](auto s, auto a, auto b) {
+            return s * a + static_cast<decltype(a)>(1 - s) * b;
+        };
+
+        // Avoid 'if' within warp by doing a linear interpolation between
+        // the two endpoints with s either 0 or 1
+        const auto s = static_cast<T>(a < minimum);
+        minimum = interpolate(s, a, minimum);
+        return interpolate(s, i, j);
+    };
+
+    // Find the minimum for each thread among the values in y
+    for (size_t i = threadIdx.x; i < y.size(); i += blockDim.x) {
+        minrow = argmin(updatedRowValue(i), i, minrow);
+    }
+
+    const uint32_t lane = gpu::laneID();
+    auto minlaneWarpReduction = [&minimum, &minrow, &argmin, &lane]() {
+        // We're tracking the lane with the minimum, along with the minimum
+        // value This way there's less data movement necessary
+        uint32_t minlane = lane;
+        uint32_t delta = gpu::WARP_SIZE >> 1u;
+        while (delta > 0ul) {
+            minlane =
+                argmin(__shfl_down(minimum, delta), lane + delta, minlane);
+            delta >>= 1u;
+        }
+
+        // Get the minrow index from the lane with the minimum to lane 0
+        minrow = __shfl_down(minrow, minlane);
+    };
+
+    // Do a warp reduction of the argmins
+    minlaneWarpReduction();
+    const uint32_t wid = gpu::warpID();
+    if (0 == lane) {
+        scratch.values[wid] = minimum;
+        scratch.indices[wid] = minrow;
+    }
+
+    // Wait until ever warp has updated scratch with their minimums
+    __syncthreads();
+
+    // The first warp should do the final reduction
+    if (0 == wid) {
+        minimum = lane < gpu::numWarpsInBlock() ? scratch.values[lane]
+                                                : static_cast<T>(INFINITY);
+        minrow = lane < gpu::numWarpsInBlock() ? scratch.indices[lane] : 0;
+        minlaneWarpReduction();
+
+        // Lane 0 of warp 0 has the block minimum and the index corresponding to
+        // that value. If the minimum is negative, store the row index as
+        // positive. The sign of the number is used as a continue/break
+        // condition in a while loop.
+        if (0 == lane) {
+            scratch.indices[0] = (2 * (minimum < 0) - 1) * minrow;
         }
     }
 
-    // TODO: argmin needs to be implemented differently
-    result = blockReduceRegs(scratch, op, result, initial);
+    __syncthreads();
 
-    return -1;
+    minrow = scratch.indices[0];
+
+    __syncthreads();
+
+    return minrow;
 }
 
 template <typename T>
@@ -377,9 +471,11 @@ __device__ void updateXY(const typename SparseMatrix<T>::View &m, BitVector x,
 
     for (uint32_t tid = threadIdx.x; tid < data.size(); tid += blockDim.x) {
         const auto col = indices[tid];
+        // If xi is one, we'll subtract the data, as xi will be changed to zero
         y[col] += data[tid] * (-2.0f * xi + 1);
     }
 
+    // Don't flip the bit until every warp is ready
     __syncthreads();
 
     if (0 == threadIdx.x) {
@@ -391,7 +487,7 @@ __device__ void updateXY(const typename SparseMatrix<T>::View &m, BitVector x,
 
 template <typename T, typename Op>
 __device__ T updateMinimum(BitVector &x, BitVector &min_x, std::span<T> y,
-                           T min_y, std::span<T> scratch, Op op, T initial) {
+                           T min_y, Scratch<T> &scratch, Op op, T initial) {
     auto result = blockReduce(y, scratch, op, initial);
     if (result < min_y) {
         min_y = result;
@@ -404,7 +500,7 @@ __device__ T updateMinimum(BitVector &x, BitVector &min_x, std::span<T> y,
 template <typename T>
 __device__ T blockSearch(const typename SparseMatrix<T>::View &m, BitVector &x,
                          BitVector &min_x, std::span<T> y, T min_y,
-                         std::span<T> scratch) {
+                         Scratch<T> &scratch) {
     generateRandomX(x);
     mx(m, x, y);
 
@@ -417,7 +513,7 @@ __device__ T blockSearch(const typename SparseMatrix<T>::View &m, BitVector &x,
     }
 
     return updateMinimum(
-        x, mx, y, min_y, scratch, [](auto a, auto b) { return a + b; }, 0);
+        x, min_x, y, min_y, scratch, [](auto a, auto b) { return a + b; }, 0);
 }
 
 template <typename T>
@@ -436,10 +532,9 @@ __device__ void search(const typename SparseMatrix<T>::View &m,
                      len_x));
     BitVector block_min_x(num_cols, std::span<S>(block_x.span().end(), len_x));
 
-    // TODO: maybe alignment?
-    std::span<T> scratch(static_cast<T *>(static_cast<void *>(
-                             block_min_x.span().data() + len_x)),
-                         gpu::numWarpsInBlock());
+    Scratch<T> scratch(static_cast<std::byte *>(static_cast<void *>(
+                           block_min_x.span().data() + len_x)),
+                       gpu::numWarpsInBlock());
 
     auto minimum_y = static_cast<T>(INFINITY);
     for (uint32_t bid = blockIdx.x; bid < num_values_to_search;
@@ -484,8 +579,6 @@ __global__ void searchKernel(const typename SparseMatrix<T>::View &m,
     std::span<T> block_y(static_cast<T *>(static_cast<void *>(shared_mem)),
                          m.shape().second);
 
-    // TODO: maybe align these correctly
-    // The remainder of the shared memory is passed on
     const auto ptr = static_cast<std::byte *>(
         static_cast<void *>(block_y.data() + block_y.size()));
     const auto bytes = shared_mem_bytes - block_y.size_bytes();
