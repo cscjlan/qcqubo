@@ -279,6 +279,9 @@ __host__ __device__ void *alignPtr(void *ptr, size_t alof) {
     return static_cast<uint8_t *>(ptr) + misalignment;
 };
 
+// TODO: maybe use spans?
+// return span that has been reduced in size
+// can be used in determining the number of bytes required in total
 template <typename T> struct Scratch {
     T *values = nullptr;
     uint32_t *indices = nullptr;
@@ -311,14 +314,14 @@ makeAlignedSpan(std::span<uint8_t> data, uint32_t len) {
 }
 
 template <typename T>
-__host__ __device__ std::pair<std::array<std::intptr_t, 3>, std::span<uint8_t>>
-offsets(std::span<uint8_t> span) {
+__host__ __device__ std::pair<std::array<void *, 3>, std::span<uint8_t>>
+structPointers(std::span<uint8_t> span) {
     auto ptr = span.data();
     auto incrPtr = [&ptr, &span]<typename V>() {
         ptr = static_cast<uint8_t *>(alignPtr(ptr, alignof(V)));
-        const auto offset = ptr - span.data();
+        const auto aligned = static_cast<void *>(ptr);
         ptr += sizeof(V);
-        return offset;
+        return aligned;
     };
 
     return std::make_pair(
@@ -330,23 +333,23 @@ offsets(std::span<uint8_t> span) {
         std::span<uint8_t>(ptr, span.size_bytes() - (ptr - span.data())));
 }
 
+// TODO: This should return the remainder reduced by the used bytes so it can be
+// used to determine the number of bytes in total
 template <typename T>
-__host__ __device__ void constructStructs(std::span<uint8_t> mem,
+__host__ __device__ void constructStructs(std::array<void *, 3> ptrs,
+                                          std::span<uint8_t> remainder,
                                           uint32_t num_cols, uint32_t len_x) {
-    auto [offs, remainder] = offsets<T>(mem);
     using S = typename BitVector::S;
 
     std::span<S> aligned;
     std::tie(aligned, remainder) = makeAlignedSpan<S>(remainder, len_x);
 
-    *static_cast<BitVector *>(static_cast<void *>(mem.data() + offs[0])) =
-        BitVector(num_cols, aligned);
+    *static_cast<BitVector *>(ptrs[0]) = BitVector(num_cols, aligned);
 
     std::tie(aligned, remainder) = makeAlignedSpan<S>(remainder, len_x);
-    *static_cast<BitVector *>(static_cast<void *>(mem.data() + offs[1])) =
-        BitVector(num_cols, aligned);
+    *static_cast<BitVector *>(ptrs[1]) = BitVector(num_cols, aligned);
 
-    *static_cast<Scratch<T> *>(static_cast<void *>(mem.data() + offs[2])) =
+    *static_cast<Scratch<T> *>(ptrs[2]) =
         Scratch<T>(remainder.data(), gpu::nwarps());
 }
 
@@ -356,7 +359,7 @@ __host__ __device__ void constructStructs(std::span<uint8_t> mem,
 // product. This should be called with unique x & y if called with multiple
 // blocks
 template <typename T>
-__host__ __device__ void mx(const SparseView<T> &m, BitVector x,
+__host__ __device__ void mx(const SparseView<T> &m, BitVector &x,
                             std::span<T> y) {
     const auto shape = m.shape();
     const auto num_rows = shape.first;
@@ -392,7 +395,7 @@ __host__ __device__ void mx(const SparseView<T> &m, BitVector x,
     gpu::syncthreads();
 }
 
-__host__ __device__ void generateRandomX(BitVector x) {
+__host__ __device__ void generateRandomX(BitVector &x) {
     // TODO use hiprand, here we're just assing around
     auto span = x.span();
     for (uint32_t i = gpu::threadid(); i < span.size(); i += gpu::nthreads()) {
@@ -400,22 +403,22 @@ __host__ __device__ void generateRandomX(BitVector x) {
     }
 }
 
-// Perform a reduction over data with operator Op
-// scracth should be memory which all the threads of a block can access.
+// Perform a dot product between x and y
+// scratch should be memory which all the threads of a block can access.
 // When called with multiple blocks, data and scratch must be unique per
 // block.
-template <typename T, typename Op>
-__host__ __device__ T blockReduce(std::span<T> data, T *scratch, Op op,
-                                  T initial) {
-    T result = initial;
-    for (size_t i = gpu::threadid(); i < data.size(); i += gpu::nthreads()) {
-        result = op(result, data[i]);
+template <typename T>
+__host__ __device__ T blockDotProd(BitVector &x, std::span<T> y, T *scratch) {
+    T result = 0.0f;
+    for (size_t i = gpu::threadid(); i < y.size(); i += gpu::nthreads()) {
+        result += x[i] * y[i];
     }
 
     const uint32_t wid = gpu::warpid();
     const uint32_t lane = gpu::laneid();
+    auto sum = [](auto a, auto b) { return a + b; };
 
-    result = gpu::warpReduce(result, op);
+    result = gpu::warpReduce(result, sum);
     if (0 == lane) {
         scratch[wid] = result;
     }
@@ -425,8 +428,8 @@ __host__ __device__ T blockReduce(std::span<T> data, T *scratch, Op op,
 
     // Perform the final reduction by the first warp
     if (wid == 0) {
-        result = lane < gpu::nwarps() ? scratch[lane] : initial;
-        result = gpu::warpReduce(result, op);
+        result = lane < gpu::nwarps() ? scratch[lane] : 0.0f;
+        result = gpu::warpReduce(result, sum);
 
         // First thread stores the result in memory accessible to the entire
         // block
@@ -447,7 +450,7 @@ __host__ __device__ T blockReduce(std::span<T> data, T *scratch, Op op,
 }
 
 template <typename T>
-__host__ __device__ int32_t minimumRow(const SparseView<T> &m, BitVector x,
+__host__ __device__ int32_t minimumRow(const SparseView<T> &m, BitVector &x,
                                        std::span<T> y, Scratch<T> &scratch) {
     const auto diagonal = m.diagonal;
     T minimum = std::numeric_limits<T>::max();
@@ -527,7 +530,7 @@ __host__ __device__ int32_t minimumRow(const SparseView<T> &m, BitVector x,
 }
 
 template <typename T>
-__host__ __device__ void updateXY(const SparseView<T> &m, BitVector x,
+__host__ __device__ void updateXY(const SparseView<T> &m, BitVector &x,
                                   std::span<T> y, uint32_t row) {
     auto data = m.rowData(row);
     auto indices = m.rowIndices(row);
@@ -550,9 +553,8 @@ __host__ __device__ void updateXY(const SparseView<T> &m, BitVector x,
     gpu::syncthreads();
 }
 
-// TODO: test everything below this
 template <typename T>
-__host__ __device__ T blockSearch(const SparseView<T> &m, BitVector x,
+__host__ __device__ T blockSearch(const SparseView<T> &m, BitVector &x,
                                   std::span<T> y, Scratch<T> &scratch) {
     generateRandomX(x);
     mx(m, x, y);
@@ -563,29 +565,27 @@ __host__ __device__ T blockSearch(const SparseView<T> &m, BitVector x,
         row = minimumRow(m, x, y, scratch);
     }
 
-    return blockReduce(
-        y, scratch.values, [](auto a, auto b) { return a + b; }, 0);
+    return blockDotProd(x, y, scratch.values);
 }
 
+// TODO: test everything below this
 template <typename T>
 __host__ __device__ void search(const SparseView<T> &m, std::span<T> block_y,
                                 SuperSpan<uint32_t> min_x, std::span<T> min_y,
                                 std::span<uint8_t> mem,
                                 uint32_t num_values_to_search) {
+    auto [ptrs, remainder] = structPointers<T>(mem);
+
     if (gpu::threadid() == 0) {
         const auto num_cols = m.shape().second;
         const auto len_x = min_x.subspanLength();
-        constructStructs<T>(mem, num_cols, len_x);
+        constructStructs<T>(ptrs, remainder, num_cols, len_x);
     }
     gpu::syncthreads();
 
-    auto [offs, remainder] = offsets<T>(mem);
-    auto &block_x =
-        *static_cast<BitVector *>(static_cast<void *>(mem.data() + offs[0]));
-    auto &block_min_x =
-        *static_cast<BitVector *>(static_cast<void *>(mem.data() + offs[1]));
-    auto &scratch =
-        *static_cast<Scratch<T> *>(static_cast<void *>(mem.data() + offs[2]));
+    auto &block_x = *static_cast<BitVector *>(ptrs[0]);
+    auto &block_min_x = *static_cast<BitVector *>(ptrs[1]);
+    auto &scratch = *static_cast<Scratch<T> *>(ptrs[2]);
 
     auto minimum_y = static_cast<T>(INFINITY);
     for (uint32_t bid = gpu::blockid(); bid < num_values_to_search;
@@ -598,6 +598,7 @@ __host__ __device__ void search(const SparseView<T> &m, std::span<T> block_y,
             // block_min_x bitvector
             std::swap(block_x, block_min_x);
         }
+        gpu::syncthreads();
     }
 
     // Copy the minimum found by the block from shared memory to global memory
@@ -633,10 +634,11 @@ __global__ void searchKernel(const SparseView<T> &m, SuperSpan<uint32_t> min_x,
                              uint32_t num_values_to_search) {
     extern __shared__ uint8_t shared_mem[];
 
-    // TODO: construct y in shared memory?
     // Construct y in shared memory
     auto [block_y, remainder] = makeAlignedSpan<T>(
         std::span<uint8_t>(shared_mem, shared_mem_bytes), m.shape().second);
 
     search(m, block_y, min_x, min_y, remainder, num_values_to_search);
 }
+
+template <typename T> __host__ size_t numBytesOfSharedRequired() {}
