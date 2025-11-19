@@ -1,13 +1,50 @@
 #include <cstdio>
 #include <cstring>
-#include <iostream>
-#include <numeric>
 #include <typeinfo>
 
-#include "gpu.hpp"
 #include "qubo.hpp"
 
 namespace testing {
+void testAllocator() {
+    std::printf("Testing allocator\n");
+
+    auto testAlignment = [](auto *ptr) {
+        auto addr = reinterpret_cast<std::intptr_t>(ptr);
+        using T = std::remove_cvref_t<decltype(*ptr)>;
+        auto misalign = addr & (alignof(T) - 1);
+        std::printf("%lu, %ld, %ld\n", alignof(T), addr, misalign);
+        return misalign == 0ul;
+    };
+
+    uint8_t dummyb = 0;
+    float dummyf = 0.0f;
+    double dummyd = 0.0;
+    assert(testAlignment(&dummyb));
+    assert(testAlignment(&dummyf));
+    assert(testAlignment(&dummyd));
+
+    std::vector<uint8_t> data(1024, 0);
+    assert(testAlignment(data.data()));
+
+    Allocator allocator(data.data(), data.size());
+
+    auto *bytes = allocator.allocate<uint8_t>(3);
+    assert(bytes == data.data());
+    assert(testAlignment(bytes));
+    assert(allocator.allocated_bytes() == 3ul);
+
+    // One byte needed for alignment
+    auto *floats = allocator.allocate<float>(4);
+    assert(static_cast<void *>(floats) == data.data() + 4ul);
+    assert(testAlignment(floats));
+    assert(allocator.allocated_bytes() == 20ul);
+
+    // Four bytes needed for alignment
+    auto *doubles = allocator.allocate<double>(3);
+    assert(static_cast<void *>(doubles) == data.data() + 24ul);
+    assert(testAlignment(doubles));
+    assert(allocator.allocated_bytes() == 48ul);
+}
 struct CPUMem {
     static void *allocate(size_t num_bytes) { return std::malloc(num_bytes); }
 
@@ -2767,6 +2804,7 @@ void testWarpReduction() {
 
 // TODO write some GPU tests of the same functions
 int main() {
+    testing::testAllocator();
     testing::testFromToDense();
     testing::testBitVector();
     testing::testSuperspan();

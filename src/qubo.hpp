@@ -23,6 +23,41 @@ __host__ __device__ consteval uint32_t asPowOfTwo() {
     return POW;
 }
 
+// A very simple stack allocator that just aligns the current pointer correctly
+// and moves it forward after each allocation, returning the aligned pointer.
+// Used with shared memory
+struct Allocator {
+  private:
+    // These never move
+    uint8_t *const begin = nullptr;
+    uint8_t *const end = nullptr;
+    // This is moved as new allocation happen
+    uint8_t *current = nullptr;
+
+  public:
+    __host__ __device__ Allocator(void *ptr, size_t capacity)
+        : begin(static_cast<uint8_t *>(ptr)), end(begin + capacity),
+          current(begin) {}
+
+    template <typename T> __host__ __device__ T *allocate(size_t len) {
+        static constexpr size_t alof = alignof(T);
+        const auto misalignment =
+            (alof - (reinterpret_cast<std::intptr_t>(current) & (alof - 1))) &
+            (alof - 1);
+
+        const size_t num_bytes = len * sizeof(T);
+        uint8_t *ptr = current + misalignment;
+
+        assert(ptr + num_bytes <= end);
+
+        current = ptr + num_bytes;
+
+        return static_cast<T *>(static_cast<void *>(ptr));
+    }
+
+    size_t allocated_bytes() const { return current - begin; }
+};
+
 // This only supports square matrices
 template <typename T> struct SparseView {
   private:
@@ -271,6 +306,7 @@ struct BitVector {
     __host__ __device__ size_t size() const { return len; }
 };
 
+// DELETE BEGIN
 __host__ __device__ void *alignPtr(void *ptr, size_t alof) {
     const auto misalignment =
         (alof - (reinterpret_cast<std::intptr_t>(ptr) & (alof - 1))) &
@@ -279,9 +315,6 @@ __host__ __device__ void *alignPtr(void *ptr, size_t alof) {
     return static_cast<uint8_t *>(ptr) + misalignment;
 };
 
-// TODO: maybe use spans?
-// return span that has been reduced in size
-// can be used in determining the number of bytes required in total
 template <typename T> struct Scratch {
     T *values = nullptr;
     uint32_t *indices = nullptr;
@@ -333,8 +366,6 @@ structPointers(std::span<uint8_t> span) {
         std::span<uint8_t>(ptr, span.size_bytes() - (ptr - span.data())));
 }
 
-// TODO: This should return the remainder reduced by the used bytes so it can be
-// used to determine the number of bytes in total
 template <typename T>
 __host__ __device__ void constructStructs(std::array<void *, 3> ptrs,
                                           std::span<uint8_t> remainder,
@@ -352,6 +383,8 @@ __host__ __device__ void constructStructs(std::array<void *, 3> ptrs,
     *static_cast<Scratch<T> *>(ptrs[2]) =
         Scratch<T>(remainder.data(), gpu::nwarps());
 }
+
+// DELETE END
 
 // Matrix-vector product with a sparse matrix m and a bitvector x
 // Result is stored in y
