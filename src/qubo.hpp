@@ -386,12 +386,10 @@ __host__ __device__ void constructStructs(std::array<void *, 3> ptrs,
 // product. This should be called with unique x & y if called with multiple
 // blocks
 template <typename T>
-__host__ __device__ void mx(const SparseView<T> &m, BitVector &x,
-                            std::span<T> y) {
+__host__ __device__ void mx(const SparseView<T> &m, BitVector &x, T *y) {
     const auto shape = m.shape();
     const auto num_rows = shape.first;
     const auto num_cols = shape.second;
-    assert(y.size() == num_rows);
 
     const uint32_t wid = gpu::warpid();
     const uint32_t wstride = gpu::nwarps();
@@ -434,9 +432,9 @@ __host__ __device__ void generateRandomX(BitVector &x, size_t n) {
 // When called with multiple blocks, data and scratch must be unique per
 // block.
 template <typename T>
-__host__ __device__ T blockDotProd(BitVector &x, std::span<T> y, T *scratch) {
+__host__ __device__ T blockDotProd(BitVector &x, T *y, T *scratch, size_t n) {
     T result = 0.0f;
-    for (size_t i = gpu::threadid(); i < y.size(); i += gpu::nthreads()) {
+    for (size_t i = gpu::threadid(); i < n; i += gpu::nthreads()) {
         result += x[i] * y[i];
     }
 
@@ -477,8 +475,9 @@ __host__ __device__ T blockDotProd(BitVector &x, std::span<T> y, T *scratch) {
 
 template <typename T>
 __host__ __device__ int32_t minimumRow(const SparseView<T> &m, BitVector &x,
-                                       std::span<T> y, Scratch<T> &scratch) {
+                                       T *y, Scratch<T> &scratch) {
     const auto diagonal = m.diagonal;
+    const auto n = m.shape().first;
     T minimum = std::numeric_limits<T>::max();
     int32_t minrow = -1;
 
@@ -513,7 +512,7 @@ __host__ __device__ int32_t minimumRow(const SparseView<T> &m, BitVector &x,
     };
 
     // Find the minimum for each thread among the values in y
-    for (size_t i = gpu::threadid(); i < y.size(); i += gpu::nthreads()) {
+    for (size_t i = gpu::threadid(); i < n; i += gpu::nthreads()) {
         std::tie(minimum, minrow) =
             argmin(updatedRowValue(i), minimum, i, minrow);
     }
@@ -556,8 +555,8 @@ __host__ __device__ int32_t minimumRow(const SparseView<T> &m, BitVector &x,
 }
 
 template <typename T>
-__host__ __device__ void updateXY(const SparseView<T> &m, BitVector &x,
-                                  std::span<T> y, uint32_t row) {
+__host__ __device__ void updateXY(const SparseView<T> &m, BitVector &x, T *y,
+                                  uint32_t row) {
     auto data = m.rowData(row);
     auto indices = m.rowIndices(row);
     const T xi = x.operator[]<T>(row);
@@ -580,9 +579,10 @@ __host__ __device__ void updateXY(const SparseView<T> &m, BitVector &x,
 }
 
 template <typename T>
-__host__ __device__ T blockSearch(const SparseView<T> &m, BitVector &x,
-                                  std::span<T> y, Scratch<T> &scratch) {
-    generateRandomX(x, m.shape().first);
+__host__ __device__ T blockSearch(const SparseView<T> &m, BitVector &x, T *y,
+                                  Scratch<T> &scratch) {
+    const auto n = m.shape().first;
+    generateRandomX(x, n);
     mx(m, x, y);
 
     auto row = minimumRow(m, x, y, scratch);
@@ -591,15 +591,14 @@ __host__ __device__ T blockSearch(const SparseView<T> &m, BitVector &x,
         row = minimumRow(m, x, y, scratch);
     }
 
-    return blockDotProd(x, y, scratch.values);
+    return blockDotProd(x, y, scratch.values, n);
 }
 
 // TODO: test everything below this
 template <typename T>
-__host__ __device__ void search(const SparseView<T> &m, std::span<T> block_y,
-                                SuperSpan<uint32_t> min_x, std::span<T> min_y,
-                                std::span<uint8_t> mem,
-                                uint32_t num_values_to_search) {
+__host__ __device__ void
+search(const SparseView<T> &m, T *block_y, SuperSpan<uint32_t> min_x, T *min_y,
+       std::span<uint8_t> mem, uint32_t num_values_to_search) {
     auto [ptrs, remainder] = structPointers<T>(mem);
 
     if (gpu::threadid() == 0) {
@@ -642,21 +641,20 @@ __host__ __device__ void search(const SparseView<T> &m, std::span<T> block_y,
 }
 
 template <typename T>
-__global__ void searchKernel(const SparseView<T> &m, SuperSpan<T> y,
-                             SuperSpan<uint32_t> min_x, std::span<T> min_y,
-                             size_t shared_mem_bytes,
-                             uint32_t num_values_to_search) {
+__global__ void
+searchKernel(const SparseView<T> &m, SuperSpan<T> y, SuperSpan<uint32_t> min_x,
+             T *min_y, size_t shared_mem_bytes, uint32_t num_values_to_search) {
     extern __shared__ uint8_t shared_mem[];
     // Use y from global memory
     auto block_y = y.subspan(gpu::blockid());
-    search(m, block_y, min_x, min_y,
+    search(m, block_y.data(), min_x, min_y,
            std::span<uint8_t>(shared_mem, shared_mem_bytes),
            num_values_to_search);
 }
 
 template <typename T>
 __global__ void searchKernel(const SparseView<T> &m, SuperSpan<uint32_t> min_x,
-                             std::span<T> min_y, size_t shared_mem_bytes,
+                             T *min_y, size_t shared_mem_bytes,
                              uint32_t num_values_to_search) {
     extern __shared__ uint8_t shared_mem[];
 

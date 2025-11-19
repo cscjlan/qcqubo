@@ -343,7 +343,7 @@ void testmx1() {
 
     std::vector<float> yd(num_rows, 0);
 
-    mx(m, x, std::span(yd));
+    mx(m, x, yd.data());
     assert(yd[0] == 11.0f);
     assert(yd[1] == 21.0f + 22.0f);
     assert(yd[2] == 32.0f + 33.0f);
@@ -880,7 +880,7 @@ void testmx2() {
 
     std::vector<double> yd(num_rows, 0);
 
-    mx(m, x, std::span(yd));
+    mx(m, x, yd.data());
 
     // m @ x computed with numpy
     std::array yres{
@@ -909,7 +909,7 @@ void testBlockDotProduct1() {
     std::vector<float> data{0.0f, -1.0f, 2.0f, 3.5f};
     float scratch = 0.0f;
 
-    assert(blockDotProd(x, std::span(data), &scratch) == 3.5f);
+    assert(blockDotProd(x, data.data(), &scratch, 4) == 3.5f);
 }
 
 void testBlockDotProduct2() {
@@ -922,7 +922,7 @@ void testBlockDotProduct2() {
     std::vector<float> data{0.0f, -1.0f, 2.0f, 3.5f};
     float scratch = 0.0f;
 
-    assert(blockDotProd(x, std::span(data), &scratch) == -1.0f + 2.0f);
+    assert(blockDotProd(x, data.data(), &scratch, 4) == -1.0f + 2.0f);
 }
 
 void testMinimumRow() {
@@ -1463,11 +1463,11 @@ void testMinimumRow() {
             return val;
         };
 
-        mx(m, x, std::span(yd));
+        mx(m, x, yd.data());
         const auto before = dot(x, yd);
 
         x.flip(row);
-        mx(m, x, std::span(yd));
+        mx(m, x, yd.data());
         const auto delta = dot(x, yd) - before;
         x.flip(row);
 
@@ -1478,11 +1478,11 @@ void testMinimumRow() {
     }
 
     // Need to compute the y values
-    mx(m, x, std::span(yd));
+    mx(m, x, yd.data());
 
     std::vector<uint8_t> scratchdata(256, 0);
     Scratch<double> scratch(scratchdata.data(), 1);
-    const auto mr = minimumRow(m, x, std::span(yd), scratch);
+    const auto mr = minimumRow(m, x, yd.data(), scratch);
     assert(min_row == mr);
     assert(abs(min_value - scratch.values[0]) < 1e-6);
 }
@@ -2016,14 +2016,14 @@ void testUpdateXY() {
     const auto minrow = 0;
     const auto oldbit = x[minrow];
     x.flip(minrow);
-    mx(m, x, std::span(yd));
+    mx(m, x, yd.data());
     const auto oldy = yd;
     x.flip(minrow);
 
     // Redo the computation to y
-    mx(m, x, std::span(yd));
+    mx(m, x, yd.data());
 
-    updateXY(m, x, std::span(yd), minrow);
+    updateXY(m, x, yd.data(), minrow);
 
     assert((oldbit ^ x[minrow]) == 1);
     assert(data[0] != 2195319283);
@@ -2633,7 +2633,7 @@ void testBlockSearch() {
     const auto sparse = fromDense(dense, num_rows);
     const auto m = sparse.getView();
 
-    const auto res = blockSearch(m, x, std::span(y), scratch);
+    const auto res = blockSearch(m, x, y.data(), scratch);
     std::printf("%f\n", res);
     // x = 82337903
     // res = -0.115629
