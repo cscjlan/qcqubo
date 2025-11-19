@@ -60,6 +60,7 @@ struct Allocator {
 
 // This only supports square matrices
 template <typename T> struct SparseView {
+    // TODO reduce size by using pointers, not spans?
   private:
     std::span<uint32_t> indptr;
     std::span<uint32_t> indices;
@@ -251,8 +252,7 @@ struct BitVector {
     using S = uint32_t;
 
   private:
-    std::span<S> data;
-    uint32_t len = 0u;
+    S *ptr = nullptr;
     static constexpr uint32_t BITS_PER_TYPE = 8u * sizeof(S);
     static constexpr uint32_t POW_OF_TWO = asPowOfTwo<BITS_PER_TYPE, 0>();
 
@@ -260,8 +260,7 @@ struct BitVector {
     // Target for copy
     __host__ __device__ BitVector() {}
 
-    __host__ __device__ BitVector(uint32_t l, std::span<S> d)
-        : data(d), len(l) {}
+    __host__ __device__ BitVector(S *p) : ptr(p) {}
 
     static uint32_t requiredLength(uint32_t len) {
         return (len >> POW_OF_TWO) + 1;
@@ -289,21 +288,16 @@ struct BitVector {
         // We should return the bit at index i
         // We'll unpack the correct value in data and return the correct bit
         // from that value.
-        assert(i < data.size() * BITS_PER_TYPE);
-        return static_cast<T>((data[dataIdx(i)] >> bitIdx(i)) & 1);
+        return static_cast<T>((ptr[dataIdx(i)] >> bitIdx(i)) & 1);
     }
 
     __host__ __device__ void flip(uint32_t i) {
         // We're flipping the bit at index i
-        assert(i < data.size() * BITS_PER_TYPE);
-        data[dataIdx(i)] ^= (1 << bitIdx(i));
+        ptr[dataIdx(i)] ^= (1 << bitIdx(i));
     }
 
-    // Return the underlying span for efficient copies/inserts of 4 byte values
-    __host__ __device__ std::span<S> span() const { return data; }
-
-    // How many bits are actual data
-    __host__ __device__ size_t size() const { return len; }
+    // Return the underlying ptr for efficient copies/inserts of 4 byte values
+    __host__ __device__ S *data() const { return ptr; }
 };
 
 // DELETE BEGIN
@@ -375,10 +369,10 @@ __host__ __device__ void constructStructs(std::array<void *, 3> ptrs,
     std::span<S> aligned;
     std::tie(aligned, remainder) = makeAlignedSpan<S>(remainder, len_x);
 
-    *static_cast<BitVector *>(ptrs[0]) = BitVector(num_cols, aligned);
+    *static_cast<BitVector *>(ptrs[0]) = BitVector(aligned.data());
 
     std::tie(aligned, remainder) = makeAlignedSpan<S>(remainder, len_x);
-    *static_cast<BitVector *>(ptrs[1]) = BitVector(num_cols, aligned);
+    *static_cast<BitVector *>(ptrs[1]) = BitVector(aligned.data());
 
     *static_cast<Scratch<T> *>(ptrs[2]) =
         Scratch<T>(remainder.data(), gpu::nwarps());
@@ -397,7 +391,6 @@ __host__ __device__ void mx(const SparseView<T> &m, BitVector &x,
     const auto shape = m.shape();
     const auto num_rows = shape.first;
     const auto num_cols = shape.second;
-    assert(x.size() == num_cols);
     assert(y.size() == num_rows);
 
     const uint32_t wid = gpu::warpid();
@@ -428,10 +421,10 @@ __host__ __device__ void mx(const SparseView<T> &m, BitVector &x,
     gpu::syncthreads();
 }
 
-__host__ __device__ void generateRandomX(BitVector &x) {
+__host__ __device__ void generateRandomX(BitVector &x, size_t n) {
     // TODO use hiprand, here we're just assing around
-    auto span = x.span();
-    for (uint32_t i = gpu::threadid(); i < span.size(); i += gpu::nthreads()) {
+    auto span = x.data();
+    for (uint32_t i = gpu::threadid(); i < n; i += gpu::nthreads()) {
         span[i] = i;
     }
 }
@@ -589,7 +582,7 @@ __host__ __device__ void updateXY(const SparseView<T> &m, BitVector &x,
 template <typename T>
 __host__ __device__ T blockSearch(const SparseView<T> &m, BitVector &x,
                                   std::span<T> y, Scratch<T> &scratch) {
-    generateRandomX(x);
+    generateRandomX(x, m.shape().first);
     mx(m, x, y);
 
     auto row = minimumRow(m, x, y, scratch);
@@ -636,7 +629,7 @@ __host__ __device__ void search(const SparseView<T> &m, std::span<T> block_y,
 
     // Copy the minimum found by the block from shared memory to global memory
     auto bmx = min_x.subspan(gpu::blockid());
-    auto bmx_shared = block_min_x.span();
+    auto bmx_shared = block_min_x.data();
     for (uint32_t tid = gpu::threadid(); tid < bmx.size();
          tid += gpu::nthreads()) {
         bmx[tid] = bmx_shared[tid];

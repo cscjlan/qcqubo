@@ -154,8 +154,8 @@ void testBitVector() {
     assert(reql == len / 32 + 1);
     std::vector<uint32_t> data(reql, 0);
 
-    BitVector bv(len, std::span(data));
-    for (auto i = 0; i < bv.size(); i++) {
+    BitVector bv(data.data());
+    for (auto i = 0; i < len; i++) {
         assert(bv[i] == 0u);
     }
 
@@ -165,16 +165,16 @@ void testBitVector() {
     assert(bv[11] == 0u);
     bv.flip(10);
 
-    for (auto i = 0; i < bv.size(); i++) {
+    for (auto i = 0; i < len; i++) {
         bv.flip(i);
     }
 
     // The last may not be entirely ones, as the length of the bit vector might
     // not be divisible by 32
-    auto last = bv.span().back();
-    assert(last == (~0u) << (32 - (bv.size() % 32)));
-    for (auto v = bv.span().begin(); v != bv.span().end() - 1; v++) {
-        assert(*v == ~0u);
+    auto last = bv.data()[reql - 1];
+    assert(last == (~0u) << (32 - (len % 32)));
+    for (auto i = 0; i < reql - 1; i++) {
+        assert(bv.data()[i] == ~0u);
     }
 
     for (auto i = 0; i < 32; i++) {
@@ -339,7 +339,7 @@ void testmx1() {
 
     const auto reql = BitVector::requiredLength(num_rows);
     std::vector<uint32_t> data(reql, ~0u);
-    BitVector x(num_rows, std::span(data));
+    BitVector x(data.data());
 
     std::vector<float> yd(num_rows, 0);
 
@@ -876,7 +876,7 @@ void testmx2() {
 
     const auto reql = BitVector::requiredLength(num_rows);
     std::vector<uint32_t> data(reql, 2195319283);
-    BitVector x(num_rows, std::span(data));
+    BitVector x(data.data());
 
     std::vector<double> yd(num_rows, 0);
 
@@ -903,7 +903,7 @@ void testBlockDotProduct1() {
     std::printf("Testing block dot product 1\n");
     std::vector<uint32_t> vec(BitVector::requiredLength(4), 0);
 
-    BitVector x(4, std::span(vec));
+    BitVector x(vec.data());
     x.flip(0);
     x.flip(3);
     std::vector<float> data{0.0f, -1.0f, 2.0f, 3.5f};
@@ -916,7 +916,7 @@ void testBlockDotProduct2() {
     std::printf("Testing block dot product 2\n");
     std::vector<uint32_t> vec(BitVector::requiredLength(4), 0);
 
-    BitVector x(4, std::span(vec));
+    BitVector x(vec.data());
     x.flip(1);
     x.flip(2);
     std::vector<float> data{0.0f, -1.0f, 2.0f, 3.5f};
@@ -1448,7 +1448,7 @@ void testMinimumRow() {
 
     const auto reql = BitVector::requiredLength(num_rows);
     std::vector<uint32_t> data(reql, 2195319283);
-    BitVector x(num_rows, std::span(data));
+    BitVector x(data.data());
 
     std::vector<double> yd(num_rows, 0);
 
@@ -2010,7 +2010,7 @@ void testUpdateXY() {
 
     const auto reql = BitVector::requiredLength(num_rows);
     std::vector<uint32_t> data(reql, 2195319283);
-    BitVector x(num_rows, std::span(data));
+    BitVector x(data.data());
     std::vector<double> yd(num_rows, 0);
 
     const auto minrow = 0;
@@ -2085,45 +2085,6 @@ template <typename T, typename... Ts> void checkOverlaps(T t, Ts... ts) {
     }
 }
 
-void testStructConstructionInMemory() {
-    std::printf("Testing struct construction\n");
-    // TODO function for calculating the byte req
-    // then reques that many bytes
-    std::vector<uint8_t> data(1024, 0);
-    auto [ptrs, remainder] = structPointers<double>(data);
-    constructStructs<float>(ptrs, remainder, 33, 2);
-    auto bv = *static_cast<BitVector *>(ptrs[0]);
-
-    assert(bv.size() == 33);
-    assert(bv.span().size() == 2);
-    bv.flip(32);
-    assert(bv.span()[0] == 0);
-    assert(bv.span()[1] == 1 << 31);
-
-    bv = *static_cast<BitVector *>(ptrs[1]);
-    assert(bv.size() == 33);
-    assert(bv.span().size() == 2);
-    bv.flip(32);
-    assert(bv.span()[0] == 0);
-    assert(bv.span()[1] == 1 << 31);
-
-    auto scratch = *static_cast<Scratch<float> *>(ptrs[2]);
-    assert(scratch.len == 1);
-    assert(scratch.values != nullptr);
-    assert(scratch.indices != nullptr);
-
-    assert(overlaps(std::span(data.data(), 1), std::span(data.data(), 2)));
-    assert(
-        not overlaps(std::span(data.data(), 1), std::span(data.data() + 1, 2)));
-
-    std::span<BitVector> bv1(static_cast<BitVector *>(ptrs[0]), 1);
-    std::span<BitVector> bv2(static_cast<BitVector *>(ptrs[1]), 1);
-    std::span<Scratch<float>> scr(static_cast<Scratch<float> *>(ptrs[2]), 1);
-
-    checkOverlaps(bv1, bv1[0].span(), bv2, bv2[0].span(), scr,
-                  std::span(scr[0].values, 1), std::span(scr[0].indices, 1));
-}
-
 void testSwapping() {
     std::printf("Testing swapping\n");
     std::vector<uint8_t> data(1024, 0);
@@ -2131,15 +2092,15 @@ void testSwapping() {
     constructStructs<float>(ptrs, remainder, 33, 2);
 
     auto &bv1 = *static_cast<BitVector *>(ptrs[0]);
-    bv1.span()[0] = 666;
+    bv1.data()[0] = 666;
 
     auto &bv2 = *static_cast<BitVector *>(ptrs[1]);
-    bv2.span()[0] = 16;
+    bv2.data()[0] = 16;
 
     std::swap(bv1, bv2);
 
-    assert(bv1.span()[0] == 16);
-    assert(bv2.span()[0] == 666);
+    assert(bv1.data()[0] == 16);
+    assert(bv2.data()[0] == 666);
 }
 
 void testBlockSearch() {
@@ -2819,7 +2780,6 @@ int main() {
     testing::testMinimumRow();
     testing::testUpdateXY();
     testing::testStructPointers();
-    testing::testStructConstructionInMemory();
     testing::testSwapping();
     testing::testBlockSearch();
     // testing::testMatrixProduct();
