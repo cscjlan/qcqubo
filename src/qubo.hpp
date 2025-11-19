@@ -2,7 +2,6 @@
 
 #include "gpu.hpp"
 
-#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstddef>
@@ -262,15 +261,15 @@ struct BitVector {
 
     __host__ __device__ BitVector(S *p) : ptr(p) {}
 
-    static uint32_t requiredLength(uint32_t len) {
+    constexpr static uint32_t requiredLength(uint32_t len) {
         return (len >> POW_OF_TWO) + 1;
     }
 
-    static size_t memReq(uint32_t len) {
+    constexpr static size_t memReq(uint32_t len) {
         return static_cast<size_t>(requiredLength(len)) * sizeof(S);
     }
 
-    static uint32_t dataIdx(uint32_t i) { return i >> POW_OF_TWO; }
+    constexpr static uint32_t dataIdx(uint32_t i) { return i >> POW_OF_TWO; }
     // N.B! Conceputally row vectors increase in index from left to right,
     // while e.g. 32bit numbers have the lsb on the right and msb on the
     // left. To think of a series of 32bit numbers as a bit vector, we
@@ -279,16 +278,15 @@ struct BitVector {
     // then the msb of the first stored value
     // 'Reverse' the order of bits, i.e. bit_idx 0 is MSB, while bit_idx 31
     // is LSB
-    static uint32_t bitIdx(uint32_t i) {
+    constexpr static uint32_t bitIdx(uint32_t i) {
         return BITS_PER_TYPE - 1 - (i & (BITS_PER_TYPE - 1));
     }
 
-    template <typename T = uint32_t>
-    __host__ __device__ T operator[](uint32_t i) const {
+    __host__ __device__ uint32_t operator[](uint32_t i) const {
         // We should return the bit at index i
         // We'll unpack the correct value in data and return the correct bit
         // from that value.
-        return static_cast<T>((ptr[dataIdx(i)] >> bitIdx(i)) & 1);
+        return (ptr[dataIdx(i)] >> bitIdx(i)) & 1;
     }
 
     __host__ __device__ void flip(uint32_t i) {
@@ -300,93 +298,80 @@ struct BitVector {
     __host__ __device__ S *data() const { return ptr; }
 };
 
-// DELETE BEGIN
-__host__ __device__ void *alignPtr(void *ptr, size_t alof) {
-    const auto misalignment =
-        (alof - (reinterpret_cast<std::intptr_t>(ptr) & (alof - 1))) &
-        (alof - 1);
+template <typename T> struct SearchData {
+    using ThisType = SearchData<T>;
 
-    return static_cast<uint8_t *>(ptr) + misalignment;
+    BitVector candidate = {};
+    BitVector best_candidate = {};
+    T *rows = nullptr;
+    T *scratch_values = nullptr;
+    uint32_t *scratch_indices = nullptr;
+    size_t len_data = 0;
+    size_t len_scratch = 0;
+
+    static size_t memReq(size_t len_data, size_t len_scratch,
+                         bool with_rows = true) {
+        ThisType temp;
+
+        // Make an allocator just for computing the size
+        // The starting pointer is aligned for this type, so we should add
+        // alignment requirement later
+        Allocator allocator(&temp, std::numeric_limits<std::intptr_t>::max());
+
+        auto p0 = allocator.allocate<ThisType>(1);
+        auto p1 =
+            allocator.allocate<uint32_t>(BitVector::requiredLength(len_data));
+        auto p2 =
+            allocator.allocate<uint32_t>(BitVector::requiredLength(len_data));
+        if (with_rows) {
+            auto p3 = allocator.allocate<T>(len_data);
+        }
+        auto p4 = allocator.allocate<T>(len_scratch);
+        auto p5 = allocator.allocate<uint32_t>(len_scratch);
+
+        // Return the alignment requirement of this type + how many bytes are
+        // required for the data
+        return alignof(ThisType) + allocator.allocated_bytes();
+    }
+
+    __host__ SearchData() {}
+
+    __host__ __device__ SearchData(Allocator &allocator, size_t len_d,
+                                   size_t len_s)
+        : len_data(len_d), len_scratch(len_s) {
+        candidate = BitVector(
+            allocator.allocate<uint32_t>(BitVector::requiredLength(len_data)));
+        best_candidate = BitVector(
+            allocator.allocate<uint32_t>(BitVector::requiredLength(len_data)));
+        rows = allocator.allocate<T>(len_data);
+        scratch_values = allocator.allocate<T>(len_scratch);
+        scratch_indices = allocator.allocate<uint32_t>(len_scratch);
+    }
+
+    __host__ __device__ SearchData(Allocator &allocator, size_t len_d,
+                                   size_t len_s, T *rs)
+        : len_data(len_d), len_scratch(len_s) {
+        candidate = BitVector(
+            allocator.allocate<uint32_t>(BitVector::requiredLength(len_data)));
+        best_candidate = BitVector(
+            allocator.allocate<uint32_t>(BitVector::requiredLength(len_data)));
+        rows = rs;
+        scratch_values = allocator.allocate<T>(len_scratch);
+        scratch_indices = allocator.allocate<uint32_t>(len_scratch);
+    }
+
+    __host__ __device__ void swapCandidates() {
+        std::swap(candidate, best_candidate);
+    }
 };
 
-template <typename T> struct Scratch {
-    T *values = nullptr;
-    uint32_t *indices = nullptr;
-    uint32_t len = 0ul;
-
-    // Target for copy
-    __host__ __device__ Scratch() {}
-
-    __host__ __device__ Scratch(void *ptr, uint32_t num_values)
-        : values(static_cast<T *>(alignPtr(ptr, alignof(T)))),
-          indices(static_cast<uint32_t *>(
-              alignPtr(values + num_values, alignof(uint32_t)))),
-          len(num_values) {}
-};
-
-template <typename T>
-__host__ __device__ std::pair<std::span<T>, std::span<uint8_t>>
-makeAlignedSpan(std::span<uint8_t> data, uint32_t len) {
-    assert(data.size_bytes() >= sizeof(T) * len);
-
-    auto ptr = alignPtr(data.data(), alignof(T));
-    auto aligned = std::span<T>(static_cast<T *>(ptr), len);
-
-    // The pointer at the end of the aligned data
-    ptr = static_cast<void *>(aligned.data() + aligned.size());
-    uint8_t *bptr = static_cast<uint8_t *>(ptr);
-    const auto bytes_remaining = data.size_bytes() - (bptr - data.data());
-
-    return std::make_pair(aligned, std::span<uint8_t>(bptr, bytes_remaining));
-}
-
-template <typename T>
-__host__ __device__ std::pair<std::array<void *, 3>, std::span<uint8_t>>
-structPointers(std::span<uint8_t> span) {
-    auto ptr = span.data();
-    auto incrPtr = [&ptr, &span]<typename V>() {
-        ptr = static_cast<uint8_t *>(alignPtr(ptr, alignof(V)));
-        const auto aligned = static_cast<void *>(ptr);
-        ptr += sizeof(V);
-        return aligned;
-    };
-
-    return std::make_pair(
-        std::array{
-            incrPtr.template operator()<BitVector>(),
-            incrPtr.template operator()<BitVector>(),
-            incrPtr.template operator()<Scratch<T>>(),
-        },
-        std::span<uint8_t>(ptr, span.size_bytes() - (ptr - span.data())));
-}
-
-template <typename T>
-__host__ __device__ void constructStructs(std::array<void *, 3> ptrs,
-                                          std::span<uint8_t> remainder,
-                                          uint32_t num_cols, uint32_t len_x) {
-    using S = typename BitVector::S;
-
-    std::span<S> aligned;
-    std::tie(aligned, remainder) = makeAlignedSpan<S>(remainder, len_x);
-
-    *static_cast<BitVector *>(ptrs[0]) = BitVector(aligned.data());
-
-    std::tie(aligned, remainder) = makeAlignedSpan<S>(remainder, len_x);
-    *static_cast<BitVector *>(ptrs[1]) = BitVector(aligned.data());
-
-    *static_cast<Scratch<T> *>(ptrs[2]) =
-        Scratch<T>(remainder.data(), gpu::nwarps());
-}
-
-// DELETE END
-
-// Matrix-vector product with a sparse matrix m and a bitvector x
-// Result is stored in y
+// Matrix-vector product with a sparse matrix m and a bitvector candidate
+// Result is stored in rows
 // Implemented per-block, i.e. one block does the computation for the entire
-// product. This should be called with unique x & y if called with multiple
-// blocks
+// product. This should be called with unique candidate & rows if called with
+// multiple blocks
 template <typename T>
-__host__ __device__ void mx(const SparseView<T> &m, BitVector &x, T *y) {
+__host__ __device__ void mx(const SparseView<T> &m, SearchData<T> &sd) {
     const auto shape = m.shape();
     const auto num_rows = shape.first;
     const auto num_cols = shape.second;
@@ -404,13 +389,13 @@ __host__ __device__ void mx(const SparseView<T> &m, BitVector &x, T *y) {
         for (auto i = lane; i < row_indices.size(); i += lanestride) {
             // j is the column of the matrix
             const auto j = row_indices[i];
-            sum += row_data[i] * x[j];
+            sum += row_data[i] * sd.candidate[j];
         }
 
         // Only thread 0 gets the correct value
         sum = gpu::warpReduce(sum, [](auto a, auto b) { return a + b; });
         if (lane == 0) {
-            y[row] = sum;
+            sd.rows[row] = sum;
         }
     }
 
@@ -419,23 +404,24 @@ __host__ __device__ void mx(const SparseView<T> &m, BitVector &x, T *y) {
     gpu::syncthreads();
 }
 
-__host__ __device__ void generateRandomX(BitVector &x, size_t n) {
+template <typename T>
+__host__ __device__ void generateRandomX(SearchData<T> &sd) {
     // TODO use hiprand, here we're just assing around
-    auto span = x.data();
-    for (uint32_t i = gpu::threadid(); i < n; i += gpu::nthreads()) {
-        span[i] = i;
+    auto data = sd.candidate.data();
+    for (uint32_t i = gpu::threadid();
+         i < BitVector::requiredLength(sd.len_data); i += gpu::nthreads()) {
+        data[i] = i;
     }
 }
 
-// Perform a dot product between x and y
+// Perform a dot product between candidate and rows
 // scratch should be memory which all the threads of a block can access.
 // When called with multiple blocks, data and scratch must be unique per
 // block.
-template <typename T>
-__host__ __device__ T blockDotProd(BitVector &x, T *y, T *scratch, size_t n) {
+template <typename T> __host__ __device__ T blockDotProd(SearchData<T> &sd) {
     T result = 0.0f;
-    for (size_t i = gpu::threadid(); i < n; i += gpu::nthreads()) {
-        result += x[i] * y[i];
+    for (size_t i = gpu::threadid(); i < sd.len_data; i += gpu::nthreads()) {
+        result += sd.candidate[i] * sd.rows[i];
     }
 
     const uint32_t wid = gpu::warpid();
@@ -444,7 +430,7 @@ __host__ __device__ T blockDotProd(BitVector &x, T *y, T *scratch, size_t n) {
 
     result = gpu::warpReduce(result, sum);
     if (0 == lane) {
-        scratch[wid] = result;
+        sd.scratch_values[wid] = result;
     }
 
     // Wait until all warps in block are done
@@ -452,20 +438,20 @@ __host__ __device__ T blockDotProd(BitVector &x, T *y, T *scratch, size_t n) {
 
     // Perform the final reduction by the first warp
     if (wid == 0) {
-        result = lane < gpu::nwarps() ? scratch[lane] : 0.0f;
+        result = lane < gpu::nwarps() ? sd.scratch_values[lane] : 0.0f;
         result = gpu::warpReduce(result, sum);
 
         // First thread stores the result in memory accessible to the entire
         // block
         if (0 == lane) {
-            scratch[0] = result;
+            sd.scratch_values[0] = result;
         }
     }
 
     // Others wait until first warp is done
     gpu::syncthreads();
 
-    result = scratch[0];
+    result = sd.scratch_values[0];
 
     // Everyone waits until everyone has read the value
     gpu::syncthreads();
@@ -474,26 +460,26 @@ __host__ __device__ T blockDotProd(BitVector &x, T *y, T *scratch, size_t n) {
 }
 
 template <typename T>
-__host__ __device__ int32_t minimumRow(const SparseView<T> &m, BitVector &x,
-                                       T *y, Scratch<T> &scratch) {
+__host__ __device__ int32_t minimumRow(const SparseView<T> &m,
+                                       SearchData<T> &sd) {
     const auto diagonal = m.diagonal;
     const auto n = m.shape().first;
     T minimum = std::numeric_limits<T>::max();
     int32_t minrow = -1;
 
-    auto updatedRowValue = [&x, &y, &diagonal](auto i) {
+    auto updatedRowValue = [&sd, &diagonal](auto i) {
         static constexpr T one = static_cast<T>(1.0);
         static constexpr T two = static_cast<T>(2.0);
 
-        // If current x is zero, flipping it to 1 adds to the total, so positive
-        // sign Conversely for x == 1
-        const auto sign = -two * x.operator[]<T>(i) + one;
+        // If current candidate is zero, flipping it to 1 adds to the total, so
+        // positive sign Conversely for candidate == 1
+        const auto sign = -two * sd.candidate[i] + one;
 
-        // y may or may not contain the diagonal
-        // 2*y contains the diagonal either twice or zero times
-        // subtracting or adding the diagonal to y once will leave 2*y with
-        // the diagonal exactly once
-        const auto value = sign * (two * y[i] + sign * diagonal[i]);
+        // rows may or may not contain the diagonal
+        // 2*rows contains the diagonal either twice or zero times
+        // subtracting or adding the diagonal to rows once will leave 2*rows
+        // with the diagonal exactly once
+        const auto value = sign * (two * sd.rows[i] + sign * diagonal[i]);
 
         return value;
     };
@@ -511,7 +497,7 @@ __host__ __device__ int32_t minimumRow(const SparseView<T> &m, BitVector &x,
         return std::make_pair(interpolate(s, a, b), interpolate(s, i, j));
     };
 
-    // Find the minimum for each thread among the values in y
+    // Find the minimum for each thread among the values in rows
     for (size_t i = gpu::threadid(); i < n; i += gpu::nthreads()) {
         std::tie(minimum, minrow) =
             argmin(updatedRowValue(i), minimum, i, minrow);
@@ -522,8 +508,8 @@ __host__ __device__ int32_t minimumRow(const SparseView<T> &m, BitVector &x,
     const uint32_t lane = gpu::laneid();
     const uint32_t wid = gpu::warpid();
     if (0 == lane) {
-        scratch.values[wid] = minimum;
-        scratch.indices[wid] = minrow;
+        sd.scratch_values[wid] = minimum;
+        sd.scratch_indices[wid] = minrow;
     }
 
     // Wait until ever warp has updated scratch with their minimums
@@ -531,9 +517,9 @@ __host__ __device__ int32_t minimumRow(const SparseView<T> &m, BitVector &x,
 
     // The first warp should do the final reduction
     if (0 == wid) {
-        minimum = lane < gpu::nwarps() ? scratch.values[lane]
+        minimum = lane < gpu::nwarps() ? sd.scratch_values[lane]
                                        : static_cast<T>(INFINITY);
-        minrow = lane < gpu::nwarps() ? scratch.indices[lane] : 0;
+        minrow = lane < gpu::nwarps() ? sd.scratch_indices[lane] : 0;
         std::tie(minimum, minrow) = gpu::warpArgSearch(minimum, minrow, argmin);
 
         // Lane 0 of warp 0 has the block minimum and the index corresponding to
@@ -541,13 +527,13 @@ __host__ __device__ int32_t minimumRow(const SparseView<T> &m, BitVector &x,
         // positive. The sign of the number is used as a continue/break
         // condition in a while loop.
         if (0 == lane) {
-            scratch.indices[0] = (2 * (minimum < 0) - 1) * minrow;
+            sd.scratch_indices[0] = (2 * (minimum < 0) - 1) * minrow;
         }
     }
 
     gpu::syncthreads();
 
-    minrow = scratch.indices[0];
+    minrow = sd.scratch_indices[0];
 
     gpu::syncthreads();
 
@@ -555,114 +541,112 @@ __host__ __device__ int32_t minimumRow(const SparseView<T> &m, BitVector &x,
 }
 
 template <typename T>
-__host__ __device__ void updateXY(const SparseView<T> &m, BitVector &x, T *y,
+__host__ __device__ void updateXY(const SparseView<T> &m, SearchData<T> &sd,
                                   uint32_t row) {
     auto data = m.rowData(row);
     auto indices = m.rowIndices(row);
-    const T xi = x.operator[]<T>(row);
+    const T bit = sd.candidate[row];
 
     for (uint32_t tid = gpu::threadid(); tid < data.size();
          tid += gpu::nthreads()) {
         const auto col = indices[tid];
-        // If xi is one, we'll subtract the data, as xi will be changed to zero
-        y[col] += data[tid] * (-2.0f * xi + 1);
+        // If bit is one, we'll subtract the data, as bit will be changed to
+        // zero
+        sd.rows[col] += data[tid] * (-2.0f * bit + 1);
     }
 
     // Don't flip the bit until every warp is ready
     gpu::syncthreads();
 
     if (0 == gpu::threadid()) {
-        x.flip(row);
+        sd.candidate.flip(row);
     }
 
     gpu::syncthreads();
 }
 
 template <typename T>
-__host__ __device__ T blockSearch(const SparseView<T> &m, BitVector &x, T *y,
-                                  Scratch<T> &scratch) {
+__host__ __device__ T blockSearch(const SparseView<T> &m, SearchData<T> &sd) {
     const auto n = m.shape().first;
-    generateRandomX(x, n);
-    mx(m, x, y);
+    generateRandomX(sd);
+    mx(m, sd);
 
-    auto row = minimumRow(m, x, y, scratch);
+    auto row = minimumRow(m, sd);
     while (row >= 0) {
-        updateXY(m, x, y, row);
-        row = minimumRow(m, x, y, scratch);
+        updateXY(m, sd, row);
+        row = minimumRow(m, sd);
     }
 
-    return blockDotProd(x, y, scratch.values, n);
+    return blockDotProd(sd);
 }
 
-// TODO: test everything below this
 template <typename T>
-__host__ __device__ void
-search(const SparseView<T> &m, T *block_y, SuperSpan<uint32_t> min_x, T *min_y,
-       std::span<uint8_t> mem, uint32_t num_values_to_search) {
-    auto [ptrs, remainder] = structPointers<T>(mem);
-
-    if (gpu::threadid() == 0) {
-        const auto num_cols = m.shape().second;
-        const auto len_x = min_x.subspanLength();
-        constructStructs<T>(ptrs, remainder, num_cols, len_x);
-    }
-    gpu::syncthreads();
-
-    auto &block_x = *static_cast<BitVector *>(ptrs[0]);
-    auto &block_min_x = *static_cast<BitVector *>(ptrs[1]);
-    auto &scratch = *static_cast<Scratch<T> *>(ptrs[2]);
-
-    auto minimum_y = static_cast<T>(INFINITY);
-    for (uint32_t bid = gpu::blockid(); bid < num_values_to_search;
-         bid += gpu::nblocks()) {
-        auto local_minimum = blockSearch(m, block_x, block_y, scratch);
-        if (gpu::threadid() == 0 && local_minimum < minimum_y) {
-            minimum_y = local_minimum;
-            // TODO: maybe it's sufficient to store the index with which the
-            // random number was generated then there's no need for the
-            // block_min_x bitvector
-            std::swap(block_x, block_min_x);
+__host__ __device__ T search(const SparseView<T> &m, SearchData<T> &sd,
+                             uint32_t n) {
+    auto minimum = static_cast<T>(INFINITY);
+    for (uint32_t bid = gpu::blockid(); bid < n; bid += gpu::nblocks()) {
+        auto local_minimum = blockSearch(m, sd);
+        if (gpu::threadid() == 0 && local_minimum < minimum) {
+            minimum = local_minimum;
+            sd.swapCandidates();
         }
         gpu::syncthreads();
     }
 
+    return minimum;
+}
+
+template <typename T>
+__host__ __device__ void storeMinimum(T minimum, BitVector best_candidate,
+                                      T *minimums,
+                                      SuperSpan<uint32_t> best_candidates) {
     // Copy the minimum found by the block from shared memory to global memory
-    auto bmx = min_x.subspan(gpu::blockid());
-    auto bmx_shared = block_min_x.data();
-    for (uint32_t tid = gpu::threadid(); tid < bmx.size();
+    auto mx = best_candidates.subspan(gpu::blockid());
+    auto data = best_candidate.data();
+    for (uint32_t tid = gpu::threadid(); tid < mx.size();
          tid += gpu::nthreads()) {
-        bmx[tid] = bmx_shared[tid];
+        mx[tid] = data[tid];
     }
 
-    // Update the minimum_y found by the block from register to global memory
+    // Update the minimum found by the block from register to global memory
     if (0 == gpu::threadid()) {
-        min_y[gpu::blockid()] = minimum_y;
+        minimums[gpu::blockid()] = minimum;
     }
 }
 
 template <typename T>
-__global__ void
-searchKernel(const SparseView<T> &m, SuperSpan<T> y, SuperSpan<uint32_t> min_x,
-             T *min_y, size_t shared_mem_bytes, uint32_t num_values_to_search) {
+__global__ void searchKernel(const SparseView<T> &m, SuperSpan<T> global_rows,
+                             SuperSpan<uint32_t> best_candidates, T *minimums,
+                             uint32_t num_values_to_search,
+                             size_t shared_capacity) {
     extern __shared__ uint8_t shared_mem[];
-    // Use y from global memory
-    auto block_y = y.subspan(gpu::blockid());
-    search(m, block_y.data(), min_x, min_y,
-           std::span<uint8_t>(shared_mem, shared_mem_bytes),
-           num_values_to_search);
+    Allocator allocator(shared_mem, shared_capacity);
+
+    // Use rows from global memory
+    auto *rows = global_rows.subspan(gpu::blockid()).data();
+    auto *s = allocator.allocate<SearchData<T>>(1);
+    *s = SearchData<T>(allocator, m.shape().first, gpu::nwarps(), rows);
+    assert(allocator.allocated_bytes() <= shared_capacity);
+
+    const auto minimum = search(m, *s, num_values_to_search);
+
+    storeMinimum(minimum, s->best_candidate, minimums, best_candidates);
 }
 
 template <typename T>
-__global__ void searchKernel(const SparseView<T> &m, SuperSpan<uint32_t> min_x,
-                             T *min_y, size_t shared_mem_bytes,
-                             uint32_t num_values_to_search) {
+__global__ void searchKernel(const SparseView<T> &m,
+                             SuperSpan<uint32_t> best_candidates, T *minimums,
+                             uint32_t num_values_to_search,
+                             size_t shared_capacity) {
     extern __shared__ uint8_t shared_mem[];
+    Allocator allocator(shared_mem, shared_capacity);
 
-    // Construct y in shared memory
-    auto [block_y, remainder] = makeAlignedSpan<T>(
-        std::span<uint8_t>(shared_mem, shared_mem_bytes), m.shape().second);
+    // Allocate also rows from shared memory
+    auto *s = allocator.allocate<SearchData<T>>(1);
+    *s = SearchData<T>(allocator, m.shape().first, gpu::nwarps());
+    assert(allocator.allocated_bytes() <= shared_capacity);
 
-    search(m, block_y, min_x, min_y, remainder, num_values_to_search);
+    const auto minimum = search(m, *s, num_values_to_search);
+
+    storeMinimum(minimum, s->best_candidate, minimums, best_candidates);
 }
-
-template <typename T> __host__ size_t numBytesOfSharedRequired() {}

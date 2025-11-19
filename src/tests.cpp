@@ -1,10 +1,47 @@
 #include <cstdio>
 #include <cstring>
-#include <typeinfo>
 
 #include "qubo.hpp"
 
 namespace testing {
+struct CPUMem {
+    static void *allocate(size_t num_bytes) { return std::malloc(num_bytes); }
+
+    static void free(void *ptr) { std::free(ptr); }
+
+    static void memcpy(void *dst, const void *src, size_t num_bytes) {
+        std::memcpy(dst, src, num_bytes);
+    }
+};
+
+template <typename T>
+SparseMatrix<T, CPUMem> fromDense(const std::vector<T> &dense,
+                                  uint32_t num_rows) {
+    assert(dense.size() == num_rows * num_rows);
+    std::vector<uint32_t> indptr{};
+    std::vector<uint32_t> indices{};
+    std::vector<T> data{};
+    const uint32_t num_cols = num_rows;
+
+    indptr.push_back(0);
+    for (auto row = 0; row < num_rows; row++) {
+        for (auto col = 0; col < num_cols; col++) {
+            const auto index = row * num_cols + col;
+            const auto value = dense[index];
+            if (value != 0.0) {
+                data.push_back(value);
+                indices.push_back(col);
+            }
+        }
+        const auto end = data.size();
+        indptr.push_back(end);
+    }
+
+    assert(indptr.size() == num_rows + 1);
+
+    return SparseMatrix<T, CPUMem>(indptr, indices, data);
+}
+
 void testAllocator() {
     std::printf("Testing allocator\n");
 
@@ -45,42 +82,135 @@ void testAllocator() {
     assert(testAlignment(doubles));
     assert(allocator.allocated_bytes() == 48ul);
 }
-struct CPUMem {
-    static void *allocate(size_t num_bytes) { return std::malloc(num_bytes); }
 
-    static void free(void *ptr) { std::free(ptr); }
+void testSearchDataWithRows() {
+    std::printf("Testing SearchData\n");
 
-    static void memcpy(void *dst, const void *src, size_t num_bytes) {
-        std::memcpy(dst, src, num_bytes);
-    }
-};
+    static constexpr size_t len_data = 10000;
+    static constexpr size_t len_scratch = 16;
+    using T = float;
+    using S = SearchData<T>;
 
-template <typename T>
-SparseMatrix<T, CPUMem> fromDense(const std::vector<T> &dense,
-                                  uint32_t num_rows) {
-    assert(dense.size() == num_rows * num_rows);
-    std::vector<uint32_t> indptr{};
-    std::vector<uint32_t> indices{};
-    std::vector<T> data{};
-    const uint32_t num_cols = num_rows;
+    std::vector<uint8_t> data(S::memReq(len_data, len_scratch), 0);
+    // This should be the memory requirement
+    static constexpr size_t req =
+        alignof(S) + sizeof(S) +
+        2 * BitVector::requiredLength(len_data) * sizeof(uint32_t) +
+        len_data * sizeof(T) + len_scratch * (sizeof(T) + sizeof(uint32_t));
 
-    indptr.push_back(0);
-    for (auto row = 0; row < num_rows; row++) {
-        for (auto col = 0; col < num_cols; col++) {
-            const auto index = row * num_cols + col;
-            const auto value = dense[index];
-            if (value != 0.0) {
-                data.push_back(value);
-                indices.push_back(col);
-            }
+    std::printf("Bytes required for search data: %lu, estimated: %lu\n",
+                data.size(), req);
+    assert(req == data.size());
+
+    Allocator allocator(data.data(), data.size());
+    S *s = allocator.allocate<S>(1);
+    *s = S(allocator, len_data, len_scratch);
+    assert(allocator.allocated_bytes() <= data.size());
+
+    assert(s->candidate.data() != nullptr);
+    assert(s->best_candidate.data() != nullptr);
+    assert(s->rows != nullptr);
+    assert(s->scratch_values != nullptr);
+    assert(s->scratch_indices != nullptr);
+    assert(s->len_data == len_data);
+    assert(s->len_scratch == len_scratch);
+
+    for (auto i = 0; i < s->len_data; i++) {
+        if ((i & 1) == 0) {
+            s->candidate.flip(i);
+        } else {
+            s->best_candidate.flip(i);
         }
-        const auto end = data.size();
-        indptr.push_back(end);
+        s->rows[i] = static_cast<float>(i);
     }
 
-    assert(indptr.size() == num_rows + 1);
+    for (auto i = 0; i < s->len_scratch; i++) {
+        s->scratch_values[i] = static_cast<float>(s->len_data + i);
+        s->scratch_indices[i] = 0xBEEFBEEF;
+    }
 
-    return SparseMatrix<T, CPUMem>(indptr, indices, data);
+    // assert that all the values are the same as set before:
+    // if they're different, there's some overlap between the pointers
+    for (auto i = 0; i < s->len_data; i++) {
+        if ((i & 1) == 0) {
+            assert(s->candidate[i] == 1);
+            assert(s->best_candidate[i] == 0);
+        } else {
+            assert(s->candidate[i] == 0);
+            assert(s->best_candidate[i] == 1);
+        }
+        assert(s->rows[i] == static_cast<float>(i));
+    }
+
+    for (auto i = 0; i < s->len_scratch; i++) {
+        assert(s->scratch_values[i] == static_cast<float>(s->len_data + i));
+        assert(s->scratch_indices[i] == 0xBEEFBEEF);
+    }
+}
+
+void testSearchDataWithoutRows() {
+    std::printf("Testing SearchData without allocating rows\n");
+    static constexpr size_t len_data = 10000;
+    static constexpr size_t len_scratch = 16;
+    using T = float;
+    using S = SearchData<T>;
+
+    std::vector<uint8_t> data(S::memReq(len_data, len_scratch, false), 0);
+    std::vector<T> rows(len_data, 0);
+    // This should be the memory requirement
+    static constexpr size_t req =
+        alignof(S) + sizeof(S) +
+        2 * BitVector::requiredLength(len_data) * sizeof(uint32_t) +
+        len_scratch * (sizeof(T) + sizeof(uint32_t));
+
+    std::printf("Bytes required for search data: %lu, estimated: %lu\n",
+                data.size(), req);
+    assert(req == data.size());
+
+    Allocator allocator(data.data(), data.size());
+    S *s = allocator.allocate<S>(1);
+    *s = S(allocator, len_data, len_scratch, rows.data());
+    assert(allocator.allocated_bytes() <= data.size());
+
+    assert(s->candidate.data() != nullptr);
+    assert(s->best_candidate.data() != nullptr);
+    assert(s->rows == rows.data());
+    assert(s->scratch_values != nullptr);
+    assert(s->scratch_indices != nullptr);
+    assert(s->len_data == len_data);
+    assert(s->len_scratch == len_scratch);
+
+    for (auto i = 0; i < s->len_data; i++) {
+        if ((i & 1) == 0) {
+            s->candidate.flip(i);
+        } else {
+            s->best_candidate.flip(i);
+        }
+        s->rows[i] = static_cast<float>(i);
+    }
+
+    for (auto i = 0; i < s->len_scratch; i++) {
+        s->scratch_values[i] = static_cast<float>(s->len_data + i);
+        s->scratch_indices[i] = 0xBEEFBEEF;
+    }
+
+    // assert that all the values are the same as set before:
+    // if they're different, there's some overlap between the pointers
+    for (auto i = 0; i < s->len_data; i++) {
+        if ((i & 1) == 0) {
+            assert(s->candidate[i] == 1);
+            assert(s->best_candidate[i] == 0);
+        } else {
+            assert(s->candidate[i] == 0);
+            assert(s->best_candidate[i] == 1);
+        }
+        assert(s->rows[i] == static_cast<float>(i));
+    }
+
+    for (auto i = 0; i < s->len_scratch; i++) {
+        assert(s->scratch_values[i] == static_cast<float>(s->len_data + i));
+        assert(s->scratch_indices[i] == 0xBEEFBEEF);
+    }
 }
 
 void testFromToDense() {
@@ -248,106 +378,34 @@ void testSuperspan2() {
     assert(data[192] == 0.0);
 }
 
-void testAlignPtr() {
-    std::printf("Testing alignptr\n");
-    std::vector<uint8_t> data(128, 0);
-    size_t szof = sizeof(double);
-    assert(alignPtr(data.data(), szof) == data.data());
-    for (auto i = 1; i < szof; i++) {
-        void *ptr = data.data() + i;
-        assert(alignPtr(ptr, szof) == data.data() + szof);
-    }
-
-    szof = sizeof(uint32_t);
-    assert(alignPtr(data.data(), szof) == data.data());
-    for (auto i = 1; i < szof; i++) {
-        void *ptr = data.data() + i;
-        assert(alignPtr(ptr, szof) == data.data() + szof);
-    }
-
-    szof = sizeof(uint8_t);
-    assert(alignPtr(data.data(), szof) == data.data());
-    for (auto i = 1; i < szof; i++) {
-        void *ptr = data.data() + i;
-        assert(alignPtr(ptr, szof) == data.data() + i);
-    }
-
-    auto ptr = alignPtr(data.data() + 1, 8);
-    assert(ptr == alignPtr(ptr, 8));
-}
-
-void testScratch() {
-    std::printf("Testing scratch\n");
-    std::vector<uint8_t> data(256, 0);
-
-    using V = double;
-    const size_t n = 13;
-
-    Scratch<V> scratch(data.data() + 1, n);
-
-    void *ptr = scratch.values;
-    size_t space = data.size();
-
-    assert(ptr == data.data() + sizeof(V));
-    assert(std::align(alignof(V), sizeof(V) * n, ptr, space) == ptr);
-    assert(space == data.size());
-
-    ptr = scratch.indices;
-
-    assert(ptr == data.data() + sizeof(V) * 14);
-    assert(std::align(alignof(uint32_t), sizeof(uint32_t) * n, ptr, space) ==
-           ptr);
-    assert(space == data.size());
-
-    assert(scratch.len == n);
-}
-
-void testMakeAlignedSpan() {
-    std::printf("Testing makeAlignedSpan\n");
-    std::vector<uint8_t> data(256, 0);
-    constexpr static size_t n = 7;
-
-    using V = double;
-    const auto [us, rem] = makeAlignedSpan<uint32_t>(std::span(data), n);
-    assert(static_cast<void *>(us.data()) == data.data());
-    assert(us.size() == n);
-    assert(rem.size() == data.size() - n * sizeof(uint32_t));
-    assert(rem.data() == data.data() + us.size_bytes());
-
-    const auto [vs, rem2] = makeAlignedSpan<V>(rem, n);
-    assert(static_cast<void *>(vs.data()) ==
-           data.data() + (n + 1) * sizeof(uint32_t));
-    assert(vs.size() == n);
-    assert(rem2.size() ==
-           data.size() - (n + 1) * sizeof(uint32_t) - n * sizeof(V));
-    assert(rem2.data() ==
-           data.data() + us.size_bytes() + sizeof(uint32_t) + vs.size_bytes());
-}
-
 void testmx1() {
     std::printf("Testing mx\n");
 
-    static constexpr uint32_t num_rows = 4;
+    static constexpr size_t len_data = 4;
+    static constexpr size_t len_scratch = 1;
+    using T = float;
+    using S = SearchData<T>;
+
+    std::vector<uint8_t> data(S::memReq(len_data, len_scratch), 0);
+    Allocator allocator(data.data(), data.size());
+    S *s = allocator.allocate<S>(1);
+    *s = S(allocator, len_data, len_scratch);
 
     std::vector<float> dense{
         11.0f, 0.0f,  0.0f,  0.0f, 21.0f, 22.0f, 0.0f, 0.0f,
         0.0f,  32.0f, 33.0f, 0.0f, 0.0f,  0.0f,  0.0f, 44.0f,
     };
 
-    const auto sparse = fromDense(dense, num_rows);
+    const auto sparse = fromDense(dense, len_data);
     const auto m = sparse.getView();
 
-    const auto reql = BitVector::requiredLength(num_rows);
-    std::vector<uint32_t> data(reql, ~0u);
-    BitVector x(data.data());
+    s->candidate.data()[0] = ~0u;
 
-    std::vector<float> yd(num_rows, 0);
-
-    mx(m, x, yd.data());
-    assert(yd[0] == 11.0f);
-    assert(yd[1] == 21.0f + 22.0f);
-    assert(yd[2] == 32.0f + 33.0f);
-    assert(yd[3] == 44.0f);
+    mx(m, *s);
+    assert(s->rows[0] == 11.0f);
+    assert(s->rows[1] == 21.0f + 22.0f);
+    assert(s->rows[2] == 32.0f + 33.0f);
+    assert(s->rows[3] == 44.0f);
 }
 
 void testmx2() {
@@ -874,13 +932,18 @@ void testmx2() {
     const auto sparse = fromDense(dense, num_rows);
     const auto m = sparse.getView();
 
-    const auto reql = BitVector::requiredLength(num_rows);
-    std::vector<uint32_t> data(reql, 2195319283);
-    BitVector x(data.data());
+    static constexpr size_t len_scratch = 1;
+    using T = double;
+    using S = SearchData<T>;
 
-    std::vector<double> yd(num_rows, 0);
+    std::vector<uint8_t> data(S::memReq(num_rows, len_scratch), 0);
+    Allocator allocator(data.data(), data.size());
+    S *s = allocator.allocate<S>(1);
+    *s = S(allocator, num_rows, len_scratch);
 
-    mx(m, x, yd.data());
+    s->candidate.data()[0] = 2195319283;
+
+    mx(m, *s);
 
     // m @ x computed with numpy
     std::array yres{
@@ -894,35 +957,55 @@ void testmx2() {
     };
 
     for (auto i = 0; i < yres.size(); i++) {
-        const auto diff = abs(yd[i] - yres[i]);
+        const auto diff = abs(s->rows[i] - yres[i]);
         assert(diff < 1e-5);
     }
 }
 
 void testBlockDotProduct1() {
     std::printf("Testing block dot product 1\n");
-    std::vector<uint32_t> vec(BitVector::requiredLength(4), 0);
 
-    BitVector x(vec.data());
-    x.flip(0);
-    x.flip(3);
-    std::vector<float> data{0.0f, -1.0f, 2.0f, 3.5f};
-    float scratch = 0.0f;
+    static constexpr size_t len_data = 4;
+    static constexpr size_t len_scratch = 1;
+    using T = float;
+    using S = SearchData<T>;
 
-    assert(blockDotProd(x, data.data(), &scratch, 4) == 3.5f);
+    std::vector<uint8_t> data(S::memReq(len_data, len_scratch), 0);
+    Allocator allocator(data.data(), data.size());
+    S *s = allocator.allocate<S>(1);
+    *s = S(allocator, len_data, len_scratch);
+
+    s->candidate.flip(0);
+    s->candidate.flip(3);
+    s->rows[0] = 0.0f;
+    s->rows[1] = -1.0f;
+    s->rows[2] = 2.0f;
+    s->rows[3] = 3.5f;
+
+    assert(blockDotProd(*s) == 3.5f);
 }
 
 void testBlockDotProduct2() {
     std::printf("Testing block dot product 2\n");
-    std::vector<uint32_t> vec(BitVector::requiredLength(4), 0);
 
-    BitVector x(vec.data());
-    x.flip(1);
-    x.flip(2);
-    std::vector<float> data{0.0f, -1.0f, 2.0f, 3.5f};
-    float scratch = 0.0f;
+    static constexpr size_t len_data = 4;
+    static constexpr size_t len_scratch = 1;
+    using T = float;
+    using S = SearchData<T>;
 
-    assert(blockDotProd(x, data.data(), &scratch, 4) == -1.0f + 2.0f);
+    std::vector<uint8_t> data(S::memReq(len_data, len_scratch), 0);
+    Allocator allocator(data.data(), data.size());
+    S *s = allocator.allocate<S>(1);
+    *s = S(allocator, len_data, len_scratch);
+
+    s->candidate.flip(1);
+    s->candidate.flip(2);
+    s->rows[0] = 0.0f;
+    s->rows[1] = -1.0f;
+    s->rows[2] = 2.0f;
+    s->rows[3] = 3.5f;
+
+    assert(blockDotProd(*s) == -1.0f + 2.0f);
 }
 
 void testMinimumRow() {
@@ -1446,11 +1529,16 @@ void testMinimumRow() {
     const auto sparse = fromDense(dense, num_rows);
     const auto m = sparse.getView();
 
-    const auto reql = BitVector::requiredLength(num_rows);
-    std::vector<uint32_t> data(reql, 2195319283);
-    BitVector x(data.data());
+    static constexpr size_t len_scratch = 1;
+    using T = double;
+    using S = SearchData<T>;
 
-    std::vector<double> yd(num_rows, 0);
+    std::vector<uint8_t> data(S::memReq(num_rows, len_scratch), 0);
+    Allocator allocator(data.data(), data.size());
+    S *s = allocator.allocate<S>(1);
+    *s = S(allocator, num_rows, len_scratch);
+
+    s->candidate.data()[0] = 2195319283;
 
     auto min_row = -1;
     auto min_value = std::numeric_limits<double>::max();
@@ -1463,13 +1551,13 @@ void testMinimumRow() {
             return val;
         };
 
-        mx(m, x, yd.data());
-        const auto before = dot(x, yd);
+        mx(m, *s);
+        const auto before = dot(s->candidate, s->rows);
 
-        x.flip(row);
-        mx(m, x, yd.data());
-        const auto delta = dot(x, yd) - before;
-        x.flip(row);
+        s->candidate.flip(row);
+        mx(m, *s);
+        const auto delta = dot(s->candidate, s->rows) - before;
+        s->candidate.flip(row);
 
         if (delta < min_value) {
             min_value = delta;
@@ -1478,13 +1566,11 @@ void testMinimumRow() {
     }
 
     // Need to compute the y values
-    mx(m, x, yd.data());
+    mx(m, *s);
 
-    std::vector<uint8_t> scratchdata(256, 0);
-    Scratch<double> scratch(scratchdata.data(), 1);
-    const auto mr = minimumRow(m, x, yd.data(), scratch);
+    const auto mr = minimumRow(m, *s);
     assert(min_row == mr);
-    assert(abs(min_value - scratch.values[0]) < 1e-6);
+    assert(abs(min_value - s->scratch_values[0]) < 1e-6);
 }
 
 void testUpdateXY() {
@@ -2008,112 +2094,73 @@ void testUpdateXY() {
     const auto sparse = fromDense(dense, num_rows);
     const auto m = sparse.getView();
 
-    const auto reql = BitVector::requiredLength(num_rows);
-    std::vector<uint32_t> data(reql, 2195319283);
-    BitVector x(data.data());
-    std::vector<double> yd(num_rows, 0);
+    static constexpr size_t len_scratch = 1;
+    using T = double;
+    using S = SearchData<T>;
+
+    std::vector<uint8_t> data(S::memReq(num_rows, len_scratch), 0);
+    Allocator allocator(data.data(), data.size());
+    S *s = allocator.allocate<S>(1);
+    *s = S(allocator, num_rows, len_scratch);
+
+    s->candidate.data()[0] = 2195319283;
 
     const auto minrow = 0;
-    const auto oldbit = x[minrow];
-    x.flip(minrow);
-    mx(m, x, yd.data());
-    const auto oldy = yd;
-    x.flip(minrow);
+    const auto oldbit = s->candidate[minrow];
+    s->candidate.flip(minrow);
+    mx(m, *s);
+    const std::vector<double> oldy(s->rows, s->rows + num_rows);
+    s->candidate.flip(minrow);
 
     // Redo the computation to y
-    mx(m, x, yd.data());
+    mx(m, *s);
 
-    updateXY(m, x, yd.data(), minrow);
+    updateXY(m, *s, minrow);
 
-    assert((oldbit ^ x[minrow]) == 1);
-    assert(data[0] != 2195319283);
-    x.flip(minrow);
-    assert(data[0] == 2195319283);
+    assert((oldbit ^ s->candidate[minrow]) == 1);
+    assert(s->candidate.data()[0] != 2195319283);
+    s->candidate.flip(minrow);
+    assert(s->candidate.data()[0] == 2195319283);
 
-    for (auto i = 0; i < yd.size(); i++) {
-        assert(abs(yd[i] - oldy[i]) < 1e-5);
-    }
-}
-
-void testStructPointers() {
-    std::printf("Testing structPointers\n");
-    std::vector<uint8_t> data(256, 0);
-    auto [ptrs, remainder] = structPointers<double>(data);
-    assert(ptrs[0] == static_cast<void *>(data.data()));
-    assert(ptrs[1] == static_cast<void *>(data.data() + sizeof(BitVector)));
-    assert(ptrs[2] == static_cast<void *>(data.data() + 2 * sizeof(BitVector)));
-    assert(remainder.size_bytes() ==
-           data.size() - 2 * sizeof(BitVector) - sizeof(Scratch<double>));
-}
-
-template <typename T, typename U> bool overlaps(T a, U b) {
-    const auto ab = static_cast<uint8_t *>(static_cast<void *>(a.data()));
-    const auto ae =
-        static_cast<uint8_t *>(static_cast<void *>(a.data())) + a.size_bytes();
-    const auto bb = static_cast<uint8_t *>(static_cast<void *>(b.data()));
-    const auto be =
-        static_cast<uint8_t *>(static_cast<void *>(b.data())) + b.size_bytes();
-
-    bool overlap = bb <= ab && ab < be;
-    overlap |= bb < ae && ae <= be;
-
-    overlap |= ab <= bb && bb < ae;
-    overlap |= ab < be && be <= ae;
-
-    overlap &= a.size_bytes() > 0 && b.size_bytes() > 0;
-
-    return overlap;
-}
-
-template <typename T, typename Head, typename... Tail>
-void checkOverlap(T t, Head head, Tail... tail) {
-    const auto res = overlaps(t, head);
-    if (res) {
-        std::printf("overlap between %s and %s\n", typeid(t).name(),
-                    typeid(head).name());
-    }
-    assert(not res);
-    if constexpr (sizeof...(Tail) > 0) {
-        checkOverlap(t, tail...);
-    }
-}
-
-template <typename T, typename... Ts> void checkOverlaps(T t, Ts... ts) {
-    checkOverlap(t, ts...);
-    if constexpr (sizeof...(Ts) > 1) {
-        checkOverlaps(ts...);
+    for (auto i = 0; i < oldy.size(); i++) {
+        assert(abs(s->rows[i] - oldy[i]) < 1e-5);
     }
 }
 
 void testSwapping() {
     std::printf("Testing swapping\n");
-    std::vector<uint8_t> data(1024, 0);
-    auto [ptrs, remainder] = structPointers<double>(data);
-    constructStructs<float>(ptrs, remainder, 33, 2);
 
-    auto &bv1 = *static_cast<BitVector *>(ptrs[0]);
-    bv1.data()[0] = 666;
+    static constexpr size_t len_data = 33;
+    static constexpr size_t len_scratch = 1;
+    using T = double;
+    using S = SearchData<T>;
 
-    auto &bv2 = *static_cast<BitVector *>(ptrs[1]);
-    bv2.data()[0] = 16;
+    std::vector<uint8_t> data(S::memReq(len_data, len_scratch), 0);
+    Allocator allocator(data.data(), data.size());
+    S *s = allocator.allocate<S>(1);
+    *s = S(allocator, len_data, len_scratch);
 
-    std::swap(bv1, bv2);
+    s->candidate.data()[0] = 666;
+    s->best_candidate.data()[0] = 16;
 
-    assert(bv1.data()[0] == 16);
-    assert(bv2.data()[0] == 666);
+    s->swapCandidates();
+
+    assert(s->candidate.data()[0] == 16);
+    assert(s->best_candidate.data()[0] == 666);
 }
 
 void testBlockSearch() {
     std::printf("Testing blockSearch\n");
 
     static constexpr size_t num_rows = 32;
-    std::vector<uint8_t> data(1024, 0);
-    auto [ptrs, remainder] = structPointers<double>(data);
-    constructStructs<float>(ptrs, remainder, num_rows, num_rows / 32);
+    static constexpr size_t len_scratch = 1;
+    using T = float;
+    using S = SearchData<T>;
 
-    auto &x = *static_cast<BitVector *>(ptrs[0]);
-    std::vector<float> y(num_rows, 0);
-    auto &scratch = *static_cast<Scratch<float> *>(ptrs[2]);
+    std::vector<uint8_t> data(S::memReq(num_rows, len_scratch), 0);
+    Allocator allocator(data.data(), data.size());
+    S *s = allocator.allocate<S>(1);
+    *s = S(allocator, num_rows, len_scratch);
 
     std::vector<float> dense{
         0.000000000000000000e+00,  0.000000000000000000e+00,
@@ -2633,8 +2680,552 @@ void testBlockSearch() {
     const auto sparse = fromDense(dense, num_rows);
     const auto m = sparse.getView();
 
-    const auto res = blockSearch(m, x, y.data(), scratch);
+    const auto res = blockSearch(m, *s);
     std::printf("%f\n", res);
+    // x = 82337903
+    // res = -0.115629
+}
+
+void testSearch() {
+    std::printf("Testing search\n");
+
+    static constexpr size_t num_rows = 32;
+    static constexpr size_t len_scratch = 1;
+    using T = float;
+    using S = SearchData<T>;
+
+    std::vector<uint8_t> data(S::memReq(num_rows, len_scratch), 0);
+    Allocator allocator(data.data(), data.size());
+    S *s = allocator.allocate<S>(1);
+    *s = S(allocator, num_rows, len_scratch);
+
+    s->best_candidate.data()[0] = 0xBEEFBEEF;
+
+    std::vector<float> dense{
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        -4.232895283264147546e-01, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  4.627865228770913220e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  6.575883075459874050e-01,
+        0.000000000000000000e+00,  6.281514945696407004e-01,
+        -4.217328051830958602e-01, 0.000000000000000000e+00,
+        5.910127532744389178e-01,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  -8.790355854774167810e-03,
+        2.399035657032428936e-01,  5.250199835819158167e-02,
+        -2.035554044705445431e-02, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  6.501697497467295861e-02,
+        -8.240040029758413098e-01, 4.867488052401565124e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        2.473701232363807456e-01,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        -3.444931828056330136e-02, 0.000000000000000000e+00,
+        -3.001427301219831145e-01, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  -3.330649206177298538e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  6.575883075459874050e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        2.473701232363807456e-01,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        -1.718096360536883749e-01, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        -8.660942874272103964e-02, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        -1.717021325965639722e-02, -5.248309328882472258e-02,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  2.821093812908759269e-02,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  1.887095635332367571e-01,
+        0.000000000000000000e+00,  6.281514945696407004e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  -8.550213112602664811e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  -4.647517004860979295e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  -5.151925797152027142e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        8.859965928243378475e-01,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  -4.217328051830958602e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        -1.718096360536883749e-01, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  3.363097945018211909e-01,
+        -4.315385988647291171e-02, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  -2.177985376072406609e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        6.563911360371292858e-01,  -6.500723857190968680e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  6.474346087339870603e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        2.178060956224650013e-01,  0.000000000000000000e+00,
+        -1.914746094668813292e-01, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  5.910127532744389178e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        -8.587598326659406922e-01, -6.077811714737161308e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        -3.789078659232718582e-01, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  -2.763317878129920580e-01,
+        8.008688587847569984e-01,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  -3.059244962344520591e-02,
+        3.464055624404833722e-01,  -3.111709284125441233e-02,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        -9.864123571925798029e-02, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  -4.647517004860979295e-01,
+        3.363097945018211909e-01,  0.000000000000000000e+00,
+        -6.077811714737161308e-01, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        5.277810901685664469e-01,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        -4.207833461127837849e-01, 0.000000000000000000e+00,
+        5.908138443118962080e-01,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  -3.633758035104645012e-01,
+        -7.109600367501045515e-02, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  -1.645201802586591100e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        -8.660942874272103964e-02, 0.000000000000000000e+00,
+        -4.315385988647291171e-02, 6.563911360371292858e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  2.174809786964613245e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  -1.206976921478641884e-02,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  3.906731791546584898e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        -1.878931772154205371e-01, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  -1.522882794387103722e-02,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  -6.500723857190968680e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        2.174809786964613245e-01,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  7.068591291476598037e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  6.500083509961545047e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        -3.789078659232718582e-01, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  7.257910002004175354e-02,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  -5.583638046685115430e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  5.277810901685664469e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        2.938248632622524337e-01,  0.000000000000000000e+00,
+        7.970094608366529165e-01,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        5.874757870480507016e-01,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  6.474346087339870603e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  7.068591291476598037e-01,
+        7.257910002004175354e-02,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        -4.667447874380803441e-02, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        8.197945593944377940e-02,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        -4.232895283264147546e-01, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        -1.717021325965639722e-02, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  -7.969005779536852963e-03,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  -8.790355854774167810e-03,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        -5.248309328882472258e-02, -5.151925797152027142e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        -1.206976921478641884e-02, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  6.184367225476927743e-02,
+        0.000000000000000000e+00,  2.610972628118792827e-01,
+        -2.321901900322242973e-02, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  2.399035657032428936e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  -4.207833461127837849e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  -4.667447874380803441e-02,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        -2.522454692377209540e-01, 0.000000000000000000e+00,
+        -7.807706424253757493e-02, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  5.250199835819158167e-02,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  1.270154459561219085e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  -2.035554044705445431e-02,
+        -3.444931828056330136e-02, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  8.859965928243378475e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  5.908138443118962080e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        -1.235940404425517336e-01, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        -1.319663660705574504e-01, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        -2.763317878129920580e-01, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  6.500083509961545047e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        -7.969005779536852963e-03, 6.184367225476927743e-02,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  5.019801758935558134e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        -3.001427301219831145e-01, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  2.178060956224650013e-01,
+        8.008688587847569984e-01,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        2.938248632622524337e-01,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        -2.522454692377209540e-01, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  1.362132403440559081e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  -5.145824118212235510e-01,
+        0.000000000000000000e+00,  4.872536693312274902e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        3.906731791546584898e-01,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  2.610972628118792827e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        1.362132403440559081e-01,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  4.594076925471877182e-01,
+        1.561953419674908528e-01,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  3.822357359135244437e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  -1.914746094668813292e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        7.970094608366529165e-01,  8.197945593944377940e-02,
+        0.000000000000000000e+00,  -2.321901900322242973e-02,
+        -7.807706424253757493e-02, 0.000000000000000000e+00,
+        -1.235940404425517336e-01, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  6.003250079824384855e-02,
+        9.155910346888727069e-01,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  1.749643220520866738e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        2.821093812908759269e-02,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        -3.059244962344520591e-02, -3.633758035104645012e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  4.594076925471877182e-01,
+        6.003250079824384855e-02,  0.000000000000000000e+00,
+        -2.996100193096786768e-01, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        3.464055624404833722e-01,  -7.109600367501045515e-02,
+        -1.878931772154205371e-01, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  1.561953419674908528e-01,
+        9.155910346888727069e-01,  -2.996100193096786768e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  3.639079862139427135e-02,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        -3.330649206177298538e-01, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        -3.111709284125441233e-02, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  1.270154459561219085e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        -5.145824118212235510e-01, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        6.469282406991374579e-01,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  -6.699200351591384495e-01,
+        0.000000000000000000e+00,  3.790225991247342385e-01,
+        0.000000000000000000e+00,  6.501697497467295861e-02,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  -1.645201802586591100e-01,
+        -1.522882794387103722e-02, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        4.872536693312274902e-01,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        3.639079862139427135e-02,  0.000000000000000000e+00,
+        -6.699200351591384495e-01, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  -8.240040029758413098e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        -9.864123571925798029e-02, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        5.874757870480507016e-01,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        -1.319663660705574504e-01, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  6.469282406991374579e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        4.627865228770913220e-01,  4.867488052401565124e-01,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        1.887095635332367571e-01,  0.000000000000000000e+00,
+        -2.177985376072406609e-01, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        -5.583638046685115430e-01, 0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  5.019801758935558134e-01,
+        0.000000000000000000e+00,  3.822357359135244437e-01,
+        1.749643220520866738e-01,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+        3.790225991247342385e-01,  0.000000000000000000e+00,
+        0.000000000000000000e+00,  0.000000000000000000e+00,
+    };
+
+    const auto sparse = fromDense(dense, num_rows);
+    const auto m = sparse.getView();
+
+    // Do computation
+    const auto minimum = search(m, *s, 1);
+
+    std::printf("%f, %u, %u\n", minimum, s->candidate.data()[0],
+                s->best_candidate.data()[0]);
+    assert(s->candidate.data()[0] == 0xBEEFBEEF);
+    assert(s->best_candidate.data()[0] != 0xBEEFBEEF);
     // x = 82337903
     // res = -0.115629
 }
@@ -2766,22 +3357,21 @@ void testWarpReduction() {
 // TODO write some GPU tests of the same functions
 int main() {
     testing::testAllocator();
+    testing::testSearchDataWithRows();
+    testing::testSearchDataWithoutRows();
     testing::testFromToDense();
     testing::testBitVector();
     testing::testSuperspan();
     testing::testSuperspan2();
-    testing::testAlignPtr();
-    testing::testScratch();
-    testing::testMakeAlignedSpan();
     testing::testmx1();
     testing::testmx2();
     testing::testBlockDotProduct1();
     testing::testBlockDotProduct2();
     testing::testMinimumRow();
     testing::testUpdateXY();
-    testing::testStructPointers();
     testing::testSwapping();
     testing::testBlockSearch();
+    testing::testSearch();
     // testing::testMatrixProduct();
     // testing::testSparseMatrix();
     // testing::testWarpReduction();
