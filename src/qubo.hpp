@@ -629,7 +629,6 @@ __global__ void searchKernel(const SparseView<T> &m, SuperSpan<T> global_rows,
     assert(allocator.allocated_bytes() <= shared_capacity);
 
     const auto minimum = search(m, *s, num_values_to_search);
-
     storeMinimum(minimum, s->best_candidate, minimums, best_candidates);
 }
 
@@ -647,6 +646,5 @@ __global__ void searchKernel(const SparseView<T> &m,
     assert(allocator.allocated_bytes() <= shared_capacity);
 
     const auto minimum = search(m, *s, num_values_to_search);
-
     storeMinimum(minimum, s->best_candidate, minimums, best_candidates);
 }

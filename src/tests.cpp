@@ -1,6 +1,10 @@
 #include <cstdio>
 #include <cstring>
+#include <iostream>
+#include <numeric>
+#include <span>
 
+#include "gpu.hpp"
 #include "qubo.hpp"
 
 namespace testing {
@@ -3230,65 +3234,23 @@ void testSearch() {
     // res = -0.115629
 }
 
-/*
-void testMatrixProduct() {
-    using T = float;
-    constexpr static auto n = 4;
-    std::vector<uint32_t> indptr{0, 2, 3, 4, 5};
-    std::vector<uint32_t> indices{0, 2, 1, 2, 3};
-    std::vector<T> data{11.0f, 13.0f, 22.0f, 33.0f, 44.0f};
-
-    const SparseMatrix<T, CPUMem> mat(indptr, indices, data);
-
-    std::vector<T> x(n, 1.0f);
-    std::vector<T> y(n, 0.0f);
-
-    auto mem_x = gpu::allocate(sizeof(T) * x.size());
-    auto mem_y = gpu::allocate(sizeof(T) * y.size());
-
-    std::span<T> x_d(static_cast<T *>(mem_x), x.size());
-    std::span<T> y_d(static_cast<T *>(mem_y), y.size());
-
-    gpu::memcpy(x_d.data(), x.data(), x_d.size_bytes());
-    gpu::memcpy(y_d.data(), y.data(), y_d.size_bytes());
-
-    // LAUNCH_KERNEL(mp, 1, 64, 0, 0, "", mat.view, x_d, y_d);
-
-    gpu::memcpy(y.data(), y_d.data(), y_d.size_bytes());
-
-    assert(y[0] == 24.0f);
-    assert(y[1] == 22.0f);
-    assert(y[2] == 33.0f);
-    assert(y[3] == 44.0f);
-
-    gpu::free(mem_x);
-    gpu::free(mem_y);
-}
-
-template <typename T, typename Op>
-__global__ void warpReductionKernel(std::span<T> values, Op op) {
-    auto value = threadIdx.x < values.size() ? values[threadIdx.x] : 0;
-    value = gpu::warpReduce(value, op);
-    if (threadIdx.x == 0) {
-        values[0] = value;
-    }
-}
-
 void testSparseMatrix() {
+    std::printf("Testing sparse matrix\n");
+
     constexpr static auto n = 4;
     std::vector<uint32_t> indptr{0, 2, 3, 4, 5};
     std::vector<uint32_t> indices{0, 2, 1, 2, 3};
     std::vector<float> data{11.0f, 13.0f, 22.0f, 33.0f, 44.0f};
 
-    const SparseMatrix mat(indptr, indices, data);
-    const auto diagonal = mat.view.diagonal;
+    const SparseMatrix<float, CPUMem> mat(indptr, indices, data);
+    const auto diagonal = mat.getView().diagonal;
 
     assert(diagonal[0] == 11.0f);
     assert(diagonal[1] == 22.0f);
     assert(diagonal[2] == 33.0f);
     assert(diagonal[3] == 44.0f);
 
-    const auto dense = mat.view.toDense();
+    const auto dense = mat.getView().toDense();
     auto i = 0;
     for (auto d : dense) {
         const auto row = i / n + 1;
@@ -3303,11 +3265,20 @@ void testSparseMatrix() {
         std::cout << d << std::endl;
         i++;
     }
+}
 
-    gpu::synchronize();
+template <typename T, typename Op>
+__global__ void warpReductionKernel(std::span<T> values, Op op) {
+    auto value = threadIdx.x < values.size() ? values[threadIdx.x] : 0;
+    value = gpu::warpReduce(value, op);
+    if (threadIdx.x == 0) {
+        values[0] = value;
+    }
 }
 
 void testWarpReduction() {
+    std::printf("Testing warp reduction\n");
+
     const uint32_t n = gpu::warpSize();
     auto mem = gpu::allocate(sizeof(double) * n);
 
@@ -3351,10 +3322,99 @@ void testWarpReduction() {
 
     gpu::free(mem);
 }
-*/
+
+template <typename T, typename Op>
+__global__ void warpArgSearchKernel(std::span<T> values, uint32_t *indices,
+                                    Op op) {
+    auto value = threadIdx.x < values.size() ? values[threadIdx.x] : 0;
+    auto index = threadIdx.x < values.size() ? indices[threadIdx.x] : 0;
+    std::tie(value, index) = gpu::warpArgSearch(value, index, op);
+    if (threadIdx.x == 0) {
+        values[0] = value;
+        indices[0] = index;
+    }
+}
+
+void testWarpArgSearch() {
+    std::printf("Testing warp arg search\n");
+
+    const uint32_t n = gpu::warpSize();
+    auto values = gpu::allocate(sizeof(float) * n);
+    auto indices = gpu::allocate(sizeof(uint32_t) * n);
+
+    auto launchWarpArgSearch =
+        []<typename T, typename Op>(
+            std::span<T> values, const std::vector<T> &h_values,
+            std::span<uint32_t> indices, const std::vector<uint32_t> &h_indices,
+            Op op) {
+            gpu::memcpy(values.data(), h_values.data(), values.size_bytes());
+            gpu::memcpy(indices.data(), h_indices.data(), indices.size_bytes());
+
+            LAUNCH_KERNEL(warpArgSearchKernel, 1, values.size(), 0, 0, "",
+                          values, indices.data(), op);
+
+            T result = 0;
+            uint32_t index = 0;
+            gpu::memcpy(&result, values.data(), sizeof(T));
+            gpu::memcpy(&index, indices.data(), sizeof(uint32_t));
+
+            T h_result = h_values[0];
+            uint32_t j = 0;
+            for (auto i = 1; i < h_values.size(); i++) {
+                std::tie(h_result, j) = op(h_result, h_values[i], j, i);
+            }
+            uint32_t h_index = h_indices[j];
+
+            std::cout << result << ", " << h_result << std::endl;
+            std::cout << index << ", " << h_index << std::endl;
+
+            assert(result == h_result);
+            assert(index == h_index);
+        };
+
+    auto op = [](auto a, auto b, auto i, auto j) {
+        const auto s = static_cast<decltype(a)>(a < b);
+        return std::make_pair(s * a + (1 - s) * b, s * i + (1 - s) * j);
+    };
+    launchWarpArgSearch(
+        std::span(static_cast<uint32_t *>(values), n),
+        [&n]() {
+            std::vector<uint32_t> values(n);
+            std::iota(values.begin(), values.end(), 0);
+            return values;
+        }(),
+        std::span(static_cast<uint32_t *>(indices), n),
+        [&n]() {
+            std::vector<uint32_t> values(n);
+            std::iota(values.begin(), values.end(), 0);
+            std::reverse(values.begin(), values.end());
+            return values;
+        }(),
+        op);
+
+    launchWarpArgSearch(
+        std::span(static_cast<float *>(values), n),
+        [&n]() {
+            std::vector<float> values(n);
+            std::generate(values.begin(), values.end(), [&n, i = 0]() mutable {
+                return -static_cast<float>(n) / 2.0f + (i++);
+            });
+            return values;
+        }(),
+        std::span(static_cast<uint32_t *>(indices), n),
+        [&n]() {
+            std::vector<uint32_t> values(n);
+            std::iota(values.begin(), values.end(), 0);
+            return values;
+        }(),
+        op);
+
+    gpu::free(values);
+    gpu::free(indices);
+}
+
 } // namespace testing
 
-// TODO write some GPU tests of the same functions
 int main() {
     testing::testAllocator();
     testing::testSearchDataWithRows();
@@ -3372,10 +3432,11 @@ int main() {
     testing::testSwapping();
     testing::testBlockSearch();
     testing::testSearch();
-    // testing::testMatrixProduct();
-    // testing::testSparseMatrix();
-    // testing::testWarpReduction();
-    // gpu::synchronize();
+    testing::testSparseMatrix();
+    testing::testWarpReduction();
+    testing::testWarpArgSearch();
+
+    gpu::synchronize();
 
     return 0;
 }
