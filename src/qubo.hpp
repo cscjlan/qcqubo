@@ -3,7 +3,6 @@
 #include "gpu.hpp"
 
 #include <cassert>
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -220,6 +219,7 @@ template <typename T> struct SuperSpan {
         return requiredLength(num_subspans, subspan_len) * sizeof(T);
     }
 
+    SuperSpan() {}
     SuperSpan(std::span<T> d, uint32_t num, uint32_t len)
         : data(d), num_subspans(num), subspan_len(len) {
         static_assert(ALIGN > 0, "ALIGN must be greater than zero");
@@ -371,7 +371,7 @@ template <typename T> struct SearchData {
 // product. This should be called with unique candidate & rows if called with
 // multiple blocks
 template <typename T>
-__host__ __device__ void mx(const SparseView<T> &m, SearchData<T> &sd) {
+__host__ __device__ void mx(const SparseView<T> &m, SearchData<T> *sd) {
     const auto shape = m.shape();
     const auto num_rows = shape.first;
     const auto num_cols = shape.second;
@@ -389,13 +389,13 @@ __host__ __device__ void mx(const SparseView<T> &m, SearchData<T> &sd) {
         for (auto i = lane; i < row_indices.size(); i += lanestride) {
             // j is the column of the matrix
             const auto j = row_indices[i];
-            sum += row_data[i] * sd.candidate[j];
+            sum += row_data[i] * sd->candidate[j];
         }
 
         // Only thread 0 gets the correct value
         sum = gpu::warpReduce(sum, [](auto a, auto b) { return a + b; });
         if (lane == 0) {
-            sd.rows[row] = sum;
+            sd->rows[row] = sum;
         }
     }
 
@@ -404,24 +404,14 @@ __host__ __device__ void mx(const SparseView<T> &m, SearchData<T> &sd) {
     gpu::syncthreads();
 }
 
-template <typename T>
-__host__ __device__ void generateRandomX(SearchData<T> &sd) {
-    // TODO use hiprand, here we're just assing around
-    auto data = sd.candidate.data();
-    for (uint32_t i = gpu::threadid();
-         i < BitVector::requiredLength(sd.len_data); i += gpu::nthreads()) {
-        data[i] = i;
-    }
-}
-
 // Perform a dot product between candidate and rows
 // scratch should be memory which all the threads of a block can access.
 // When called with multiple blocks, data and scratch must be unique per
 // block.
-template <typename T> __host__ __device__ T blockDotProd(SearchData<T> &sd) {
+template <typename T> __host__ __device__ T blockDotProd(SearchData<T> *sd) {
     T result = 0.0f;
-    for (size_t i = gpu::threadid(); i < sd.len_data; i += gpu::nthreads()) {
-        result += sd.candidate[i] * sd.rows[i];
+    for (size_t i = gpu::threadid(); i < sd->len_data; i += gpu::nthreads()) {
+        result += sd->candidate[i] * sd->rows[i];
     }
 
     const uint32_t wid = gpu::warpid();
@@ -430,7 +420,7 @@ template <typename T> __host__ __device__ T blockDotProd(SearchData<T> &sd) {
 
     result = gpu::warpReduce(result, sum);
     if (0 == lane) {
-        sd.scratch_values[wid] = result;
+        sd->scratch_values[wid] = result;
     }
 
     // Wait until all warps in block are done
@@ -438,20 +428,20 @@ template <typename T> __host__ __device__ T blockDotProd(SearchData<T> &sd) {
 
     // Perform the final reduction by the first warp
     if (wid == 0) {
-        result = lane < gpu::nwarps() ? sd.scratch_values[lane] : 0.0f;
+        result = lane < gpu::nwarps() ? sd->scratch_values[lane] : 0.0f;
         result = gpu::warpReduce(result, sum);
 
         // First thread stores the result in memory accessible to the entire
         // block
         if (0 == lane) {
-            sd.scratch_values[0] = result;
+            sd->scratch_values[0] = result;
         }
     }
 
     // Others wait until first warp is done
     gpu::syncthreads();
 
-    result = sd.scratch_values[0];
+    result = sd->scratch_values[0];
 
     // Everyone waits until everyone has read the value
     gpu::syncthreads();
@@ -460,32 +450,24 @@ template <typename T> __host__ __device__ T blockDotProd(SearchData<T> &sd) {
 }
 
 template <typename T>
-__host__ __device__ int32_t minimumRow(const SparseView<T> &m,
-                                       SearchData<T> &sd) {
+__host__ __device__ bool minimumRow(const SparseView<T> &m, SearchData<T> *sd,
+                                    uint32_t &minrow) {
     const auto diagonal = m.diagonal;
     const auto n = m.shape().first;
     T minimum = std::numeric_limits<T>::max();
-    int32_t minrow = -1;
 
-    auto updatedRowValue = [&sd, &diagonal](auto i) {
+    auto updatedRowValue = [sd, &diagonal](auto i) {
         static constexpr T one = static_cast<T>(1.0);
         static constexpr T two = static_cast<T>(2.0);
 
         // If current candidate is zero, flipping it to 1 adds to the total, so
         // positive sign Conversely for candidate == 1
-        const auto sign = -two * sd.candidate[i] + one;
-
-        // rows may or may not contain the diagonal
-        // 2*rows contains the diagonal either twice or zero times
-        // subtracting or adding the diagonal to rows once will leave 2*rows
-        // with the diagonal exactly once
-        const auto value = sign * (two * sd.rows[i] + sign * diagonal[i]);
+        const auto sign = -two * sd->candidate[i] + one;
+        const auto value = sign * two * sd->rows[i] + diagonal[i];
 
         return value;
     };
 
-    // This updates the minimum internally and returns the index corresponding
-    // to that minimum
     auto argmin = [](auto a, auto b, auto i, auto j) {
         auto interpolate = [](auto s, auto a, auto b) {
             return s * a + static_cast<decltype(a)>(1 - s) * b;
@@ -493,7 +475,7 @@ __host__ __device__ int32_t minimumRow(const SparseView<T> &m,
 
         // Avoid 'if' within warp by doing a linear interpolation between
         // the two endpoints with s either 0 or 1
-        const auto s = static_cast<T>(a < b);
+        const auto s = static_cast<T>(a <= b);
         return std::make_pair(interpolate(s, a, b), interpolate(s, i, j));
     };
 
@@ -508,8 +490,8 @@ __host__ __device__ int32_t minimumRow(const SparseView<T> &m,
     const uint32_t lane = gpu::laneid();
     const uint32_t wid = gpu::warpid();
     if (0 == lane) {
-        sd.scratch_values[wid] = minimum;
-        sd.scratch_indices[wid] = minrow;
+        sd->scratch_values[wid] = minimum;
+        sd->scratch_indices[wid] = minrow;
     }
 
     // Wait until ever warp has updated scratch with their minimums
@@ -517,78 +499,76 @@ __host__ __device__ int32_t minimumRow(const SparseView<T> &m,
 
     // The first warp should do the final reduction
     if (0 == wid) {
-        minimum = lane < gpu::nwarps() ? sd.scratch_values[lane]
-                                       : static_cast<T>(INFINITY);
-        minrow = lane < gpu::nwarps() ? sd.scratch_indices[lane] : 0;
+        minimum = lane < gpu::nwarps() ? sd->scratch_values[lane]
+                                       : std::numeric_limits<T>::max();
+        minrow = lane < gpu::nwarps() ? sd->scratch_indices[lane] : 0;
         std::tie(minimum, minrow) = gpu::warpArgSearch(minimum, minrow, argmin);
 
-        // Lane 0 of warp 0 has the block minimum and the index corresponding to
-        // that value. If the minimum is negative, store the row index as
-        // positive. The sign of the number is used as a continue/break
-        // condition in a while loop.
         if (0 == lane) {
-            sd.scratch_indices[0] = (2 * (minimum < 0) - 1) * minrow;
+            sd->scratch_indices[0] = minrow;
+            sd->scratch_values[0] = minimum;
         }
     }
 
     gpu::syncthreads();
 
-    minrow = sd.scratch_indices[0];
+    minrow = sd->scratch_indices[0];
+    const bool keep_searching = sd->scratch_values[0] < 0;
 
     gpu::syncthreads();
 
-    return minrow;
+    return keep_searching;
 }
 
 template <typename T>
-__host__ __device__ void updateXY(const SparseView<T> &m, SearchData<T> &sd,
+__host__ __device__ void updateXY(const SparseView<T> &m, SearchData<T> *sd,
                                   uint32_t row) {
     auto data = m.rowData(row);
     auto indices = m.rowIndices(row);
-    const T bit = sd.candidate[row];
+    const T bit = sd->candidate[row];
 
     for (uint32_t tid = gpu::threadid(); tid < data.size();
          tid += gpu::nthreads()) {
         const auto col = indices[tid];
         // If bit is one, we'll subtract the data, as bit will be changed to
         // zero
-        sd.rows[col] += data[tid] * (-2.0f * bit + 1);
+        sd->rows[col] += data[tid] * (-2 * bit + 1);
     }
 
     // Don't flip the bit until every warp is ready
     gpu::syncthreads();
 
     if (0 == gpu::threadid()) {
-        sd.candidate.flip(row);
+        sd->candidate.flip(row);
     }
 
     gpu::syncthreads();
 }
 
-template <typename T>
-__host__ __device__ T blockSearch(const SparseView<T> &m, SearchData<T> &sd) {
+template <typename T, typename BitVecGen>
+__host__ __device__ T blockSearch(const SparseView<T> &m, SearchData<T> *sd,
+                                  BitVecGen generator) {
     const auto n = m.shape().first;
-    generateRandomX(sd);
+    generator(sd);
     mx(m, sd);
 
-    auto row = minimumRow(m, sd);
-    while (row >= 0) {
+    auto row = 0u;
+    while (minimumRow(m, sd, row)) {
         updateXY(m, sd, row);
-        row = minimumRow(m, sd);
     }
 
     return blockDotProd(sd);
 }
 
-template <typename T>
-__host__ __device__ T search(const SparseView<T> &m, SearchData<T> &sd,
-                             uint32_t n) {
-    auto minimum = static_cast<T>(INFINITY);
-    for (uint32_t bid = gpu::blockid(); bid < n; bid += gpu::nblocks()) {
-        auto local_minimum = blockSearch(m, sd);
+template <typename T, typename BitVecGen>
+__host__ __device__ T search(const SparseView<T> &m, SearchData<T> *sd,
+                             size_t n, BitVecGen generator) {
+    auto minimum = std::numeric_limits<T>::max();
+    for (size_t bid = gpu::blockid(); bid < n; bid += gpu::nblocks()) {
+        auto local_minimum = blockSearch(m, sd, generator);
         if (gpu::threadid() == 0 && local_minimum < minimum) {
             minimum = local_minimum;
-            sd.swapCandidates();
+            sd->swapCandidates();
         }
         gpu::syncthreads();
     }
@@ -614,11 +594,11 @@ __host__ __device__ void storeMinimum(T minimum, BitVector best_candidate,
     }
 }
 
-template <typename T>
-__global__ void searchKernel(const SparseView<T> &m, SuperSpan<T> global_rows,
+template <typename T, typename BitVecGen>
+__global__ void searchKernel(SparseView<T> m, SuperSpan<T> global_rows,
                              SuperSpan<uint32_t> best_candidates, T *minimums,
-                             uint32_t num_values_to_search,
-                             size_t shared_capacity) {
+                             size_t num_values_to_search,
+                             size_t shared_capacity, BitVecGen generator) {
     extern __shared__ uint8_t shared_mem[];
     Allocator allocator(shared_mem, shared_capacity);
 
@@ -626,25 +606,107 @@ __global__ void searchKernel(const SparseView<T> &m, SuperSpan<T> global_rows,
     auto *rows = global_rows.subspan(gpu::blockid()).data();
     auto *s = allocator.allocate<SearchData<T>>(1);
     *s = SearchData<T>(allocator, m.shape().first, gpu::nwarps(), rows);
-    assert(allocator.allocated_bytes() <= shared_capacity);
 
-    const auto minimum = search(m, *s, num_values_to_search);
+    const auto minimum = search(m, s, num_values_to_search, generator);
     storeMinimum(minimum, s->best_candidate, minimums, best_candidates);
 }
 
-template <typename T>
-__global__ void searchKernel(const SparseView<T> &m,
+template <typename T, typename BitVecGen>
+__global__ void searchKernel(SparseView<T> m,
                              SuperSpan<uint32_t> best_candidates, T *minimums,
-                             uint32_t num_values_to_search,
-                             size_t shared_capacity) {
+                             size_t num_values_to_search,
+                             size_t shared_capacity, BitVecGen generator) {
     extern __shared__ uint8_t shared_mem[];
     Allocator allocator(shared_mem, shared_capacity);
 
     // Allocate also rows from shared memory
     auto *s = allocator.allocate<SearchData<T>>(1);
     *s = SearchData<T>(allocator, m.shape().first, gpu::nwarps());
-    assert(allocator.allocated_bytes() <= shared_capacity);
 
-    const auto minimum = search(m, *s, num_values_to_search);
+    const auto minimum = search(m, s, num_values_to_search, generator);
     storeMinimum(minimum, s->best_candidate, minimums, best_candidates);
 }
+
+template <typename T, typename Mem, typename Generator> struct Qubo {
+  private:
+    SparseMatrix<T, Mem> mat = {};
+    size_t num_rows = 0ul;
+    size_t num_blocks = 0ul;
+    size_t num_threads = 0ul;
+    size_t subspan_len = 0ul;
+
+    using S = SuperSpan<uint32_t>;
+    std::unique_ptr<uint32_t, decltype(&Mem::free)> candidate_memory = nullptr;
+    S candidates = {};
+
+    std::unique_ptr<T, decltype(&Mem::free)> minimums = nullptr;
+    Generator generator = {};
+    size_t shared_capacity = 0ul;
+    T host_minimum = {};
+    std::vector<uint32_t> best_candidate = {};
+
+    static size_t computeNumThreads(size_t num_rows) {
+        const auto misalignment =
+            (gpu::WARP_SIZE - (num_rows & (gpu::WARP_SIZE - 1))) &
+            (gpu::WARP_SIZE - 1);
+
+        return min(1024ul, num_rows + misalignment);
+    }
+
+  public:
+    Qubo(SparseMatrix<T, Mem> &&mat, size_t nb, Generator gen)
+        : mat(std::move(mat)), num_rows(mat.getView().shape().first),
+          num_blocks(nb), num_threads(computeNumThreads(num_rows)),
+          subspan_len(BitVector::requiredLength(num_rows)),
+          candidate_memory(static_cast<uint32_t *>(Mem::allocate(
+                               S::memReq(num_blocks, subspan_len))),
+                           Mem::free),
+          candidates(std::span(candidate_memory.get(),
+                               S::requiredLength(num_blocks, subspan_len)),
+                     num_blocks, subspan_len),
+          minimums(static_cast<T *>(Mem::allocate(sizeof(T) * num_blocks)),
+                   Mem::free),
+          generator(gen),
+          shared_capacity(SearchData<T>::memReq(num_rows, gpu::nwarps())),
+          host_minimum(std::numeric_limits<T>::max()),
+          best_candidate(subspan_len, 0) {}
+
+    Qubo(const std::vector<uint32_t> &indptr,
+         const std::vector<uint32_t> &indices, const std::vector<T> &data,
+         size_t nb, Generator gen)
+        : Qubo(SparseMatrix<T, Mem>(indptr, indices, data), nb, gen) {}
+
+    void search() {
+        // TODO: launch different kernel, if shared memory req too much
+        LAUNCH_KERNEL(searchKernel<T, Generator>, num_blocks, num_threads,
+                      shared_capacity, 0, "searchKernel", mat.getView(),
+                      candidates, minimums.get(), num_blocks, shared_capacity,
+                      generator);
+
+        std::vector<T> h_minimums(num_blocks, 0);
+        gpu::memcpy(h_minimums.data(), minimums.get(), sizeof(T) * num_blocks);
+
+        const auto it = std::min_element(h_minimums.begin(), h_minimums.end());
+        const auto index = std::distance(h_minimums.begin(), it);
+        host_minimum = *it;
+
+        const auto minimizer = candidates.subspan(index);
+        gpu::memcpy(best_candidate.data(), minimizer.data(),
+                    minimizer.size_bytes());
+    }
+
+    T getMinimum() const { return host_minimum; }
+
+    std::vector<uint32_t> getCandidate() const { return best_candidate; }
+
+    std::vector<uint32_t> getBits() {
+        std::vector<uint32_t> bits(num_rows, 0);
+        BitVector bv(best_candidate.data());
+
+        for (auto i = 0; i < bits.size(); i++) {
+            bits[i] = bv[i];
+        }
+
+        return bits;
+    }
+};

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 set -exu
-flags="-xhip --std=c++20 -O3"
+flags="-xhip --std=c++20 -O0 -ggdb"
 
 if ! command -v CC &> /dev/null
 then

@@ -77,6 +77,10 @@ inline void memcpy(void *dst, const void *src, size_t num_bytes) {
     HIP_ERRCHK(hipMemcpy(dst, src, num_bytes, hipMemcpyDefault));
 }
 
+inline void memset(void *dst, uint32_t value, size_t num_bytes) {
+    HIP_ERRCHK(hipMemset(dst, value, num_bytes));
+}
+
 inline void synchronize() { HIP_ERRCHK(hipDeviceSynchronize()); }
 
 template <typename... Args>
@@ -233,8 +237,18 @@ __device__ std::pair<T, U> warpArgSearch(T t, U u, Op op) {
     uint32_t minlane = lane;
     uint32_t delta = gpu::WARP_SIZE >> 1u;
     while (delta > 0ul) {
-        std::tie(t, minlane) =
-            op(__shfl_down(t, delta), t, lane + delta, minlane);
+        auto interpolate = [](auto a, auto b, auto s) {
+            return s * a + (1 - s) * b;
+        };
+        const auto s = static_cast<T>(lane + delta < gpu::nlanes());
+        // The lanes that are not active (seem to) have zeros in them.
+        // If we're doing a minimum/maximum search with strictly
+        // positive/negative values, we'll end up with a false min/max of zero
+        // taken from an inactive lane, unless we check for that.
+        auto val = interpolate(__shfl_down(t, delta), t, s);
+        auto ind = interpolate(__shfl_down(minlane, delta), minlane, s);
+
+        std::tie(t, minlane) = op(val, t, ind, minlane);
         delta >>= 1u;
     }
 
@@ -247,5 +261,13 @@ template <typename T, typename U, typename Op>
 __host__ std::pair<T, U> warpArgSearch(T t, U u, Op) {
     // Host with one thread just passes the values
     return std::make_pair(t, u);
+};
+
+struct GPUMem {
+    static void *allocate(size_t num_bytes) { return gpu::allocate(num_bytes); }
+    static void free(void *ptr) { gpu::free(ptr); }
+    static void memcpy(void *dst, const void *src, size_t num_bytes) {
+        gpu::memcpy(dst, src, num_bytes);
+    }
 };
 } // namespace gpu
