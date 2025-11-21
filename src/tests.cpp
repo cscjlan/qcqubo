@@ -1,9 +1,12 @@
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <numeric>
 #include <random>
 #include <span>
+#include <sstream>
+#include <string>
 
 #include "gpu.hpp"
 #include "qubo.hpp"
@@ -3961,19 +3964,158 @@ void testGPUSearch() {
         }
     };
     Qubo qubo(fromDense<float, gpu::GPUMem>(dense, num_rows), num_blocks,
-              generator);
+              num_blocks, generator);
     qubo.search();
 
     std::printf("%f\n", qubo.getMinimum());
 }
 
-// TODO: test against numpy reference:
-// - generate matrix
-// - generate random vectors
-// - compute with numpy: output minimum & minimizing vector
-// - read all the data in
-// - create qubo
-// - compare values
+void testAgainstNumpyReference() {
+    std::printf("Testing search against numpy reference on GPU\n");
+    auto getLines = [](std::istream &input) {
+        std::vector<std::vector<std::string>> lines;
+
+        for (std::string line; std::getline(input, line);) {
+            std::vector<std::string> result;
+            std::stringstream lineStream(line);
+
+            for (std::string cell; std::getline(lineStream, cell, ',');) {
+                result.push_back(cell);
+            }
+            lines.push_back(result);
+        }
+
+        return lines;
+    };
+
+    auto readFileToVector = [&getLines](const std::string &fname) {
+        if (std::ifstream is{fname}) {
+            return getLines(is);
+        } else {
+            std::printf("Failed to open file '%s'\n", fname.c_str());
+        }
+        assert(false);
+    };
+
+    auto packBits = [](auto line) {
+        std::vector<uint32_t> values;
+        auto val = 0;
+        auto i = 0;
+        for (auto str : line) {
+            val |= std::stoul(str) << (31 - i++);
+            if (32 == i) {
+                values.push_back(val);
+                val = 0;
+                i = 0;
+            }
+        }
+
+        if (0 != i) {
+            values.push_back(val);
+        }
+
+        return values;
+    };
+
+    std::printf("\tReading input files...\n");
+    auto lines = readFileToVector(std::string("data/candidates.csv"));
+
+    std::vector<std::vector<uint32_t>> candidates;
+    candidates.reserve(lines.size());
+    for (auto line : lines) {
+        candidates.push_back(packBits(line));
+    }
+
+    lines = readFileToVector(std::string("data/sparse_matrix.csv"));
+    assert(3 == lines.size());
+
+    std::vector<uint32_t> indptr;
+    for (auto str : lines[0]) {
+        indptr.push_back(std::stoul(str));
+    }
+
+    std::vector<uint32_t> indices;
+    for (auto str : lines[1]) {
+        indices.push_back(std::stoul(str));
+    }
+
+    std::vector<float> data;
+    for (auto str : lines[2]) {
+        data.push_back(std::stof(str));
+    }
+
+    lines = readFileToVector(std::string("data/minimum.csv"));
+    assert(2 == lines.size());
+    auto numpy_min_cand = packBits(lines[0]);
+    assert(numpy_min_cand.size() == candidates[0].size());
+
+    auto numpy_min_val = std::stof(lines[1][0]);
+
+    // For the generator: copy candidates to GPU and pack in superspan
+    using S = SuperSpan<uint32_t>;
+    auto memreq = S::memReq(candidates.size(), candidates[0].size());
+    std::unique_ptr<uint32_t, decltype(&gpu::free)> mem(
+        static_cast<uint32_t *>(gpu::allocate(memreq)), gpu::free);
+    S h_sspan(std::span(mem.get(), memreq / sizeof(uint32_t)),
+              candidates.size(), candidates[0].size());
+    for (auto i = 0; i < candidates.size(); i++) {
+        auto c = candidates[i];
+        gpu::memcpy(h_sspan.subspan(i).data(), c.data(),
+                    sizeof(uint32_t) * c.size());
+    }
+
+    // Allocate space for a SuperSpan in global memory
+    std::unique_ptr<S, decltype(&gpu::free)> d_ssup(
+        static_cast<S *>(gpu::allocate(sizeof(S))), gpu::free);
+    S *d_ssp = d_ssup.get();
+    // Copy the host superspan to device global memory
+    gpu::memcpy(d_ssp, &h_sspan, sizeof(S));
+
+    constexpr static size_t num_blocks = 1024ull;
+    std::unique_ptr<uint32_t, decltype(&gpu::free)> d_siup(
+        static_cast<uint32_t *>(gpu::allocate(sizeof(uint32_t) * num_blocks)),
+        gpu::free);
+    uint32_t *d_sip = d_siup.get();
+    gpu::memset(d_sip, 0, sizeof(uint32_t) * num_blocks);
+
+    // Finally we can make a generator that takes out values from the super span
+    // for each block
+    auto generator = [d_ssp, d_sip](auto *sd) {
+        if (0 == gpu::threadid()) {
+            atomicAdd(&d_sip[gpu::blockid()], 1u);
+        }
+        gpu::syncthreads();
+
+        auto span = d_ssp->subspan(
+            (d_sip[gpu::blockid()] - 1) * gpu::nblocks() + gpu::blockid());
+        auto data = sd->candidate.data();
+        for (uint32_t i = gpu::threadid(); i < span.size();
+             i += gpu::nthreads()) {
+            data[i] = span[i];
+        }
+
+        gpu::syncthreads();
+    };
+
+    std::printf("\tSearching...\n");
+    Qubo qubo(SparseMatrix<float, gpu::GPUMem>(indptr, indices, data),
+              num_blocks, candidates.size(), generator);
+    qubo.search();
+
+    std::printf("minimum: %f, reference minimum: %f\n", qubo.getMinimum(),
+                numpy_min_val);
+    assert(abs(qubo.getMinimum() - numpy_min_val) < 1e-6);
+
+    auto sips = std::vector<uint32_t>(num_blocks, 0);
+    gpu::memcpy(sips.data(), d_sip, sizeof(uint32_t) * sips.size());
+    const auto sum = std::reduce(sips.begin(), sips.end());
+    assert(sum == candidates.size());
+
+    const auto bc = qubo.getCandidate();
+    for (auto i = 0; i < numpy_min_cand.size(); i++) {
+        assert(numpy_min_cand[i] == bc[i]);
+    }
+}
 } // namespace testing
 
 int main() {
@@ -3997,6 +4139,7 @@ int main() {
     testing::testWarpReduction();
     testing::testWarpArgSearch();
     testing::testGPUSearch();
+    testing::testAgainstNumpyReference();
 
     gpu::synchronize();
 

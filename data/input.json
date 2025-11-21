@@ -1,0 +1,6 @@
+{
+    "seed": 123,
+    "num_to_search": 100000,
+    "matrix_filename": "data/large_matrix.csv",
+    "output_filename": "data/best_candidate.csv"
+}

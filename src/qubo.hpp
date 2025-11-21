@@ -2,7 +2,6 @@
 
 #include "gpu.hpp"
 
-#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -11,6 +10,13 @@
 #include <span>
 #include <utility>
 #include <vector>
+
+#ifndef QUBO_DISABLE_ASSERTS
+#include <cassert>
+#define QUBO_ASSERT(...) assert(__VA_ARGS__)
+#else
+#define QUBO_ASSERT(...) (void)(__VA_ARGS__);
+#endif
 
 template <uint32_t NUM, uint32_t POW>
 __host__ __device__ consteval uint32_t asPowOfTwo() {
@@ -46,7 +52,7 @@ struct Allocator {
         const size_t num_bytes = len * sizeof(T);
         uint8_t *ptr = current + misalignment;
 
-        assert(ptr + num_bytes <= end);
+        QUBO_ASSERT(ptr + num_bytes <= end);
 
         current = ptr + num_bytes;
 
@@ -73,14 +79,14 @@ template <typename T> struct SparseView {
         : indptr(ip), indices(in), data(da), diagonal(di) {}
 
     __host__ __device__ std::span<uint32_t> rowIndices(uint32_t r) const {
-        assert(r + 1 < indptr.size());
+        QUBO_ASSERT(r + 1 < indptr.size());
         const auto begin = indptr[r];
         const auto end = indptr[r + 1];
         return std::span<uint32_t>(&indices[begin], end - begin);
     }
 
     __host__ __device__ std::span<T> rowData(uint32_t r) const {
-        assert(r + 1 < indptr.size());
+        QUBO_ASSERT(r + 1 < indptr.size());
         const auto begin = indptr[r];
         const auto end = indptr[r + 1];
         return std::span<T>(&data[begin], end - begin);
@@ -177,10 +183,10 @@ template <typename T, typename Mem> struct SparseMatrix {
         auto span_indices = setSpan(indices);
         auto span_indptr = setSpan(indptr);
 
-        assert(span_data.size() == data.size());
-        assert(span_diagonal.size() == diagonal.size());
-        assert(span_indices.size() == indices.size());
-        assert(span_indptr.size() == indptr.size());
+        QUBO_ASSERT(span_data.size() == data.size());
+        QUBO_ASSERT(span_diagonal.size() == diagonal.size());
+        QUBO_ASSERT(span_indices.size() == indices.size());
+        QUBO_ASSERT(span_indptr.size() == indptr.size());
 
         view = SparseView(span_indptr, span_indices, span_data, span_diagonal);
     }
@@ -225,16 +231,16 @@ template <typename T> struct SuperSpan {
         static_assert(ALIGN > 0, "ALIGN must be greater than zero");
         static_assert((ALIGN & (ALIGN - 1)) == 0,
                       "ALIGN must be a power of two");
-        assert(d.size() == requiredLength(num_subspans, subspan_len));
+        QUBO_ASSERT(d.size() == requiredLength(num_subspans, subspan_len));
     }
 
     __host__ __device__ std::span<T> subspan(uint32_t i) const {
-        assert(i < num_subspans);
+        QUBO_ASSERT(i < num_subspans);
         // Skip all the i widths before this subspan
         const uint32_t begin = i * width(num_subspans, subspan_len);
 
         // Are we inside the super span?
-        assert(begin + subspan_len < data.size());
+        QUBO_ASSERT(begin + subspan_len < data.size());
 
         return data.subspan(begin, subspan_len);
     }
@@ -627,36 +633,48 @@ __global__ void searchKernel(SparseView<T> m,
     storeMinimum(minimum, s->best_candidate, minimums, best_candidates);
 }
 
+static size_t computeNumThreads(size_t num_rows) {
+    const auto misalignment =
+        (gpu::WARP_SIZE - (num_rows & (gpu::WARP_SIZE - 1))) &
+        (gpu::WARP_SIZE - 1);
+
+    return min(1024ul, num_rows + misalignment);
+}
+
 template <typename T, typename Mem, typename Generator> struct Qubo {
   private:
     SparseMatrix<T, Mem> mat = {};
     size_t num_rows = 0ul;
     size_t num_blocks = 0ul;
     size_t num_threads = 0ul;
+    size_t num_values_to_search = 0ul;
     size_t subspan_len = 0ul;
 
     using S = SuperSpan<uint32_t>;
-    std::unique_ptr<uint32_t, decltype(&Mem::free)> candidate_memory = nullptr;
+    std::unique_ptr<uint32_t, decltype(&Mem::free)> candidate_memory;
     S candidates = {};
 
-    std::unique_ptr<T, decltype(&Mem::free)> minimums = nullptr;
+    using ST = SuperSpan<T>;
+    std::unique_ptr<T, decltype(&Mem::free)> rows_memory;
+    ST rows = {};
+
+    std::unique_ptr<T, decltype(&Mem::free)> minimums;
     Generator generator = {};
     size_t shared_capacity = 0ul;
     T host_minimum = {};
     std::vector<uint32_t> best_candidate = {};
 
-    static size_t computeNumThreads(size_t num_rows) {
-        const auto misalignment =
-            (gpu::WARP_SIZE - (num_rows & (gpu::WARP_SIZE - 1))) &
-            (gpu::WARP_SIZE - 1);
-
-        return min(1024ul, num_rows + misalignment);
-    }
+    std::unique_ptr<hipEvent_t, decltype(&gpu::eventDestroy)> begin_event;
+    std::unique_ptr<hipEvent_t, decltype(&gpu::eventDestroy)> end_event;
+    std::unique_ptr<hipStream_t, decltype(&gpu::streamDestroy)> stream;
+    float running_time_ms = 0.0f;
 
   public:
-    Qubo(SparseMatrix<T, Mem> &&mat, size_t nb, Generator gen)
+    Qubo(SparseMatrix<T, Mem> &&mat, size_t nb, size_t num_to_search,
+         Generator gen)
         : mat(std::move(mat)), num_rows(mat.getView().shape().first),
           num_blocks(nb), num_threads(computeNumThreads(num_rows)),
+          num_values_to_search(num_to_search),
           subspan_len(BitVector::requiredLength(num_rows)),
           candidate_memory(static_cast<uint32_t *>(Mem::allocate(
                                S::memReq(num_blocks, subspan_len))),
@@ -664,24 +682,68 @@ template <typename T, typename Mem, typename Generator> struct Qubo {
           candidates(std::span(candidate_memory.get(),
                                S::requiredLength(num_blocks, subspan_len)),
                      num_blocks, subspan_len),
+          rows_memory(
+              static_cast<T *>(Mem::allocate(ST::memReq(num_blocks, num_rows))),
+              Mem::free),
+          rows(std::span(rows_memory.get(),
+                         ST::requiredLength(num_blocks, num_rows)),
+               num_blocks, num_rows),
           minimums(static_cast<T *>(Mem::allocate(sizeof(T) * num_blocks)),
                    Mem::free),
           generator(gen),
-          shared_capacity(SearchData<T>::memReq(num_rows, gpu::nwarps())),
+          shared_capacity(SearchData<T>::memReq(
+              num_rows, max(num_threads >> gpu::WARP_SIZE_BASE_TWO, 1))),
           host_minimum(std::numeric_limits<T>::max()),
-          best_candidate(subspan_len, 0) {}
+          best_candidate(subspan_len, 0),
+          begin_event(new hipEvent_t, gpu::eventDestroy),
+          end_event(new hipEvent_t, gpu::eventDestroy),
+          stream(new hipStream_t, gpu::streamDestroy) {
+        HIP_ERRCHK(hipStreamCreate(stream.get()));
+        HIP_ERRCHK(hipEventCreate(begin_event.get()));
+        HIP_ERRCHK(hipEventCreate(end_event.get()));
+    }
 
     Qubo(const std::vector<uint32_t> &indptr,
          const std::vector<uint32_t> &indices, const std::vector<T> &data,
-         size_t nb, Generator gen)
-        : Qubo(SparseMatrix<T, Mem>(indptr, indices, data), nb, gen) {}
+         size_t nb, size_t num_to_search, Generator gen)
+        : Qubo(SparseMatrix<T, Mem>(indptr, indices, data), nb, num_to_search,
+               gen) {}
 
     void search() {
-        // TODO: launch different kernel, if shared memory req too much
-        LAUNCH_KERNEL(searchKernel<T, Generator>, num_blocks, num_threads,
-                      shared_capacity, 0, "searchKernel", mat.getView(),
-                      candidates, minimums.get(), num_blocks, shared_capacity,
-                      generator);
+        int32_t device = 0;
+        int32_t max_shared_memory_per_block = 0;
+        HIP_ERRCHK(hipGetDevice(&device));
+        HIP_ERRCHK(hipDeviceGetAttribute(
+            &max_shared_memory_per_block,
+            hipDeviceAttribute_t::hipDeviceAttributeMaxSharedMemoryPerBlock,
+            device));
+
+        const bool launch_with_global_rows =
+            shared_capacity > max_shared_memory_per_block;
+
+        if (launch_with_global_rows) {
+            shared_capacity = SearchData<T>::memReq(
+                num_rows, max(num_threads >> gpu::WARP_SIZE_BASE_TWO, 1),
+                false);
+        }
+
+        HIP_ERRCHK(hipEventRecord(*begin_event.get(), *stream.get()));
+
+        if (launch_with_global_rows) {
+            std::printf("Launching using global memory for row data\n");
+            LAUNCH_KERNEL(searchKernel<T, Generator>, num_blocks, num_threads,
+                          shared_capacity, *stream.get(), "searchKernel",
+                          mat.getView(), rows, candidates, minimums.get(),
+                          num_values_to_search, shared_capacity, generator);
+        } else {
+            std::printf("Launching using shared memory for row data\n");
+            LAUNCH_KERNEL(searchKernel<T, Generator>, num_blocks, num_threads,
+                          shared_capacity, *stream.get(), "searchKernel",
+                          mat.getView(), candidates, minimums.get(),
+                          num_values_to_search, shared_capacity, generator);
+        }
+
+        HIP_ERRCHK(hipEventRecord(*end_event.get(), *stream.get()));
 
         std::vector<T> h_minimums(num_blocks, 0);
         gpu::memcpy(h_minimums.data(), minimums.get(), sizeof(T) * num_blocks);
@@ -708,5 +770,20 @@ template <typename T, typename Mem, typename Generator> struct Qubo {
         }
 
         return bits;
+    }
+
+    float getRuntime() {
+        if (running_time_ms == 0.0f) {
+            HIP_ERRCHK(hipEventSynchronize(*end_event.get()));
+            HIP_ERRCHK(hipEventElapsedTime(&running_time_ms, *begin_event.get(),
+                                           *end_event.get()));
+        }
+
+        return running_time_ms;
+    }
+
+    float searchesPerSecond() {
+        return 1000.0f * static_cast<float>(num_values_to_search) /
+               getRuntime();
     }
 };

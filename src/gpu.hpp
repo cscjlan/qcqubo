@@ -60,6 +60,16 @@ inline void hip_errchk(hipError_t result, const char *file, int32_t line) {
     }
 }
 
+inline void eventDestroy(hipEvent_t *event) {
+    HIP_ERRCHK(hipEventDestroy(*event));
+    delete event;
+}
+
+inline void streamDestroy(hipStream_t *stream) {
+    HIP_ERRCHK(hipStreamDestroy(*stream));
+    delete stream;
+}
+
 inline void *allocate(size_t num_bytes) {
     void *ptr = nullptr;
     HIP_ERRCHK(hipMalloc(&ptr, num_bytes));

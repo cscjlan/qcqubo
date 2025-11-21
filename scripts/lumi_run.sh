@@ -1,6 +1,5 @@
 #!/bin/bash
-#SBATCH --account=project_462000915
-#SBATCH --partition=dev-g
+#SBATCH --partition=standard-g
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
 #SBATCH --time=1:00:00
@@ -12,5 +11,4 @@ ml PrgEnv-cray/8.5.0
 ml craype-accel-amd-gfx90a
 ml rocm/6.0.3
 
-#srun rocprof --hip-trace bin/qubo
-srun bin/tests
+srun bin/qubo data/input.json 0

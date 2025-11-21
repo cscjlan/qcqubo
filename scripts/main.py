@@ -109,4 +109,11 @@ def main():
 
 
 if __name__ == "__main__":
+    # sq = generate_sparse_symmetric_real_matrix(20000)
+    # with open("data/large_matrix.csv", "w") as f:
+    #    sq.indptr.tofile(f, sep=",")
+    #    f.write("\n")
+    #    sq.indices.tofile(f, sep=",")
+    #    f.write("\n")
+    #    sq.data.tofile(f, sep=",")
     main()
