@@ -3967,6 +3967,13 @@ void testGPUSearch() {
     std::printf("%f\n", qubo.getMinimum());
 }
 
+// TODO: test against numpy reference:
+// - generate matrix
+// - generate random vectors
+// - compute with numpy: output minimum & minimizing vector
+// - read all the data in
+// - create qubo
+// - compare values
 } // namespace testing
 
 int main() {

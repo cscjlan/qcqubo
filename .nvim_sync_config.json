@@ -7,7 +7,8 @@
             "compile_commands.json",
             "paraview",
             ".cache",
-            "build"
+            "build",
+            "bin"
         ]
     },
     "puhti": {
@@ -18,7 +19,8 @@
             "compile_commands.json",
             "paraview",
             ".cache",
-            "build"
+            "build",
+            "bin"
         ]
     },
     "lumi": {
@@ -28,7 +30,8 @@
             ".gitignore",
             "compile_commands.json",
             ".cache",
-            "build"
+            "build",
+            "bin"
         ]
     }
 }

@@ -1,10 +1,10 @@
 import numpy as np
+from numpy.ma import minimum
 import scipy.sparse as sparse
 import scipy.sparse.linalg as linalg
 
 
 def generate_sparse_symmetric_real_matrix(n):
-    print(f"Generating a sparse symmetric real matrix of size {n}x{n}")
     mat = np.random.random((n, n))
     mat = mat + mat.T - 1.0
 
@@ -15,17 +15,9 @@ def generate_sparse_symmetric_real_matrix(n):
     return sparse.csr_array(mask * mat)
 
 
-def compute_lower_limit(x, eigenvalue):
-    # Compute the lower limit of the minimum, i.e. the value of the function
-    # at the direction of the eigenvector corresponding to the minimum eigenvalue
-    # given a vector of the same length as the found min_x.
-    # In other words, evaluate D_{ii} * (p_i . v)^2, where
-    # D_{ii} is the smallest eigenvalue
-    # p_i is the corresponding eigenvector
-    # v || p_i, i.e. v and p_i point in the same direction
-    # length(v) == length(min_x)
-    # and . is the dot product
-    return np.sum(x) * eigenvalue
+def generate_candidates(sq, num_vectors):
+    randoms = np.random.randint(0, 2, size=(num_vectors, sq.shape[0]))
+    return [Candidate(sq, x) for x in randoms]
 
 
 class Greedy:
@@ -44,31 +36,10 @@ class Greedy:
         return self.i
 
 
-class Travel:
-    def __init__(self, target):
-        self.target = target
-        self.i = 0
-
-    def keep_searching(self, candidate):
-        values = np.nonzero(candidate.x - self.target)[0]
-        any_different = len(values) > 0
-        if any_different:
-            self.i = values[0]
-
-        return any_different
-
-    def index(self):
-        return self.i
-
-
 class Candidate:
-    def __init__(self, sq, x, name):
-        self.name = name
+    def __init__(self, sq, x):
         self.x = x
-        self.minimum_x = x.copy()
         self.energies = sq @ x
-        self.total_energy = np.dot(self.x, self.energies)
-        self.minimum_energy = self.total_energy
 
     def update(self, i, sq):
         # sq is a sparse array
@@ -85,11 +56,8 @@ class Candidate:
         # Flip bit i
         self.x[i] = abs(self.x[i] - 1)
 
-        self.total_energy = np.dot(self.energies, self.x)
-
-        if self.total_energy < self.minimum_energy:
-            self.minimum_energy = self.total_energy
-            self.minimum_x = self.x.copy()
+    def total_energy(self):
+        return np.dot(self.x, self.energies)
 
 
 def search(sq, candidates, local_search):
@@ -102,80 +70,43 @@ def search(sq, candidates, local_search):
     return num_iters
 
 
-def generate_initial_candidates(sq):
-    num_eigenvalues = 100
-    num_eigenvalues = np.min((int(sq.shape[0] / 2), num_eigenvalues))
-    _, vectors = linalg.eigsh(sq, num_eigenvalues, which="SA")
-    sum_vec = np.sum(vectors, axis=1).reshape((vectors.shape[0], 1))
-
-    randoms = np.random.randint(0, 2, size=(vectors.shape[0], num_eigenvalues))
-
-    candidate_xs = np.hstack(
-        (
-            (vectors < 0).astype(np.int64),
-            (vectors > 0).astype(np.int64),
-            (sum_vec < 0).astype(np.int64),
-            (sum_vec > 0).astype(np.int64),
-            randoms,
-        )
-    )
-
-    def make_name(i, num_eigenvalues):
-        if i <= num_eigenvalues:
-            return "-" + str(i)
-        elif i <= 2 * num_eigenvalues:
-            return "+" + str(i - num_eigenvalues)
-        elif i <= 2 * num_eigenvalues + 1:
-            return "-s"
-        elif i <= 2 * num_eigenvalues + 2:
-            return "+s"
-
-        return "r" + str(i - 2 * (num_eigenvalues + 1))
-
-    return [
-        Candidate(sq, x, make_name(i + 1, num_eigenvalues))
-        for i, x in enumerate(candidate_xs.T)
-    ]
-
-
 def main():
     np.random.seed(24)
-    # sq = sparse.csr_array(np.genfromtxt("sqv.csv", delimiter=","))
-    sq = generate_sparse_symmetric_real_matrix(1000)
+    print("Generating matrix")
+    sq = generate_sparse_symmetric_real_matrix(10000)
 
     print("Generating candidates")
-    candidates = generate_initial_candidates(sq)
+    candidates = generate_candidates(sq, 2000)
 
-    print("Searching around eigenvectors")
-    # num_iters = search(sq, candidates, Greedy(sq))
-    num_iters = search(sq, candidates, Travel(np.ones(sq.shape[0])))
-    candidates.sort(key=lambda candidate: candidate.total_energy)
+    print("Searching")
+    search(sq, candidates, Greedy(sq))
+    candidates.sort(key=lambda candidate: candidate.total_energy())
     minimum_candidate = candidates[0]
 
-    print("Computing lower limit for minimum value")
-    values, _ = linalg.eigsh(sq, 1, which="SA")
-    lower_limit = compute_lower_limit(minimum_candidate.minimum_x, values[0])
-
-    print(f"number of iterations: {np.sum(num_iters)}")
-    print(f"lower limit: {lower_limit}")
+    # Print minimum energies for sanity check
     for c in candidates[:10]:
-        print(
-            f"{c.name}: {c.total_energy}, {np.sqrt(np.dot(candidates[0].minimum_x - c.minimum_x, candidates[0].minimum_x - c.minimum_x))}"
-        )
-    print(
-        f"sge_min_x: {minimum_candidate.minimum_x[:10]}...{minimum_candidate.minimum_x[-10:]}"
-    )
+        e = c.total_energy()
+        assert abs(e - c.x @ sq @ c.x) < 1e-9
+        print(f"energy: {e}")
+
+    # Write generated data to files for testing against C++-version
+    with open("data/sparse_matrix.csv", "w") as f:
+        sq.indptr.tofile(f, sep=",")
+        f.write("\n")
+        sq.indices.tofile(f, sep=",")
+        f.write("\n")
+        sq.data.tofile(f, sep=",")
+
+    with open("data/candidates.csv", "w") as f:
+        for c in candidates:
+            c.x.astype(np.uint8).tofile(f, sep=",")
+            f.write("\n")
+
+    with open("data/minimum.csv", "w") as f:
+        minimum_candidate.x.tofile(f, sep=",")
+        f.write("\n")
+        f.write(str(minimum_candidate.total_energy()))
 
 
 if __name__ == "__main__":
-    np.random.seed(24)
-    # sq = sparse.csr_array(np.genfromtxt("sqv.csv", delimiter=","))
-    for i in range(1):
-        sq = generate_sparse_symmetric_real_matrix(200)
-        with open("generated_" + str(i) + ".csv", "w") as f:
-            sq.indptr.tofile(f, sep=",")
-            f.write("\n")
-            sq.indices.tofile(f, sep=",")
-            f.write("\n")
-            sq.data.tofile(f, sep=",")
-    # main()
+    main()
