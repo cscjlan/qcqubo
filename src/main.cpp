@@ -152,7 +152,8 @@ int main(int argc, char **argv) {
         gpu::syncthreads();
     };
 
-    Qubo qubo(std::move(mat), num_blocks, num_to_search, generator);
+    Qubo qubo(std::move(mat), num_blocks, num_to_search, generator,
+              input["dv"].get<float>());
 
     LAUNCH_KERNEL(setupRandKernel, num_blocks, num_threads, 0, 0, "", states,
                   gpu_id, seed);

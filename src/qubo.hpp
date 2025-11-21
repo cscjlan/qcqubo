@@ -314,6 +314,7 @@ template <typename T> struct SearchData {
     uint32_t *scratch_indices = nullptr;
     size_t len_data = 0;
     size_t len_scratch = 0;
+    T dv = 0.0;
 
     static size_t memReq(size_t len_data, size_t len_scratch,
                          bool with_rows = true) {
@@ -343,8 +344,8 @@ template <typename T> struct SearchData {
     __host__ SearchData() {}
 
     __host__ __device__ SearchData(Allocator &allocator, size_t len_d,
-                                   size_t len_s)
-        : len_data(len_d), len_scratch(len_s) {
+                                   size_t len_s, T dv_param)
+        : len_data(len_d), len_scratch(len_s), dv(dv_param) {
         candidate = BitVector(
             allocator.allocate<uint32_t>(BitVector::requiredLength(len_data)));
         best_candidate = BitVector(
@@ -355,8 +356,8 @@ template <typename T> struct SearchData {
     }
 
     __host__ __device__ SearchData(Allocator &allocator, size_t len_d,
-                                   size_t len_s, T *rs)
-        : len_data(len_d), len_scratch(len_s) {
+                                   size_t len_s, T dv_param, T *rs)
+        : len_data(len_d), len_scratch(len_s), dv(dv_param) {
         candidate = BitVector(
             allocator.allocate<uint32_t>(BitVector::requiredLength(len_data)));
         best_candidate = BitVector(
@@ -395,7 +396,7 @@ __host__ __device__ void mx(const SparseView<T> &m, SearchData<T> *sd) {
         for (auto i = lane; i < row_indices.size(); i += lanestride) {
             // j is the column of the matrix
             const auto j = row_indices[i];
-            sum += row_data[i] * sd->candidate[j];
+            sum += (row_data[i] + sd->dv) * sd->candidate[j];
         }
 
         // Only thread 0 gets the correct value
@@ -604,30 +605,31 @@ template <typename T, typename BitVecGen>
 __global__ void searchKernel(SparseView<T> m, SuperSpan<T> global_rows,
                              SuperSpan<uint32_t> best_candidates, T *minimums,
                              size_t num_values_to_search,
-                             size_t shared_capacity, BitVecGen generator) {
+                             size_t shared_capacity, BitVecGen generator,
+                             T dv) {
     extern __shared__ uint8_t shared_mem[];
     Allocator allocator(shared_mem, shared_capacity);
 
     // Use rows from global memory
     auto *rows = global_rows.subspan(gpu::blockid()).data();
     auto *s = allocator.allocate<SearchData<T>>(1);
-    *s = SearchData<T>(allocator, m.shape().first, gpu::nwarps(), rows);
+    *s = SearchData<T>(allocator, m.shape().first, gpu::nwarps(), dv, rows);
 
     const auto minimum = search(m, s, num_values_to_search, generator);
     storeMinimum(minimum, s->best_candidate, minimums, best_candidates);
 }
 
 template <typename T, typename BitVecGen>
-__global__ void searchKernel(SparseView<T> m,
-                             SuperSpan<uint32_t> best_candidates, T *minimums,
-                             size_t num_values_to_search,
-                             size_t shared_capacity, BitVecGen generator) {
+__global__ void
+searchKernel(SparseView<T> m, SuperSpan<uint32_t> best_candidates, T *minimums,
+             size_t num_values_to_search, size_t shared_capacity,
+             BitVecGen generator, T dv) {
     extern __shared__ uint8_t shared_mem[];
     Allocator allocator(shared_mem, shared_capacity);
 
     // Allocate also rows from shared memory
     auto *s = allocator.allocate<SearchData<T>>(1);
-    *s = SearchData<T>(allocator, m.shape().first, gpu::nwarps());
+    *s = SearchData<T>(allocator, m.shape().first, gpu::nwarps(), dv);
 
     const auto minimum = search(m, s, num_values_to_search, generator);
     storeMinimum(minimum, s->best_candidate, minimums, best_candidates);
@@ -649,6 +651,7 @@ template <typename T, typename Mem, typename Generator> struct Qubo {
     size_t num_threads = 0ul;
     size_t num_values_to_search = 0ul;
     size_t subspan_len = 0ul;
+    T dv = 0.0;
 
     using S = SuperSpan<uint32_t>;
     std::unique_ptr<uint32_t, decltype(&Mem::free)> candidate_memory;
@@ -671,11 +674,11 @@ template <typename T, typename Mem, typename Generator> struct Qubo {
 
   public:
     Qubo(SparseMatrix<T, Mem> &&mat, size_t nb, size_t num_to_search,
-         Generator gen)
+         Generator gen, T dv_param)
         : mat(std::move(mat)), num_rows(mat.getView().shape().first),
           num_blocks(nb), num_threads(computeNumThreads(num_rows)),
           num_values_to_search(num_to_search),
-          subspan_len(BitVector::requiredLength(num_rows)),
+          subspan_len(BitVector::requiredLength(num_rows)), dv(dv_param),
           candidate_memory(static_cast<uint32_t *>(Mem::allocate(
                                S::memReq(num_blocks, subspan_len))),
                            Mem::free),
@@ -705,9 +708,9 @@ template <typename T, typename Mem, typename Generator> struct Qubo {
 
     Qubo(const std::vector<uint32_t> &indptr,
          const std::vector<uint32_t> &indices, const std::vector<T> &data,
-         size_t nb, size_t num_to_search, Generator gen)
+         size_t nb, size_t num_to_search, Generator gen, T dv_param)
         : Qubo(SparseMatrix<T, Mem>(indptr, indices, data), nb, num_to_search,
-               gen) {}
+               gen, dv_param) {}
 
     void search() {
         int32_t device = 0;
@@ -734,13 +737,13 @@ template <typename T, typename Mem, typename Generator> struct Qubo {
             LAUNCH_KERNEL(searchKernel<T, Generator>, num_blocks, num_threads,
                           shared_capacity, *stream.get(), "searchKernel",
                           mat.getView(), rows, candidates, minimums.get(),
-                          num_values_to_search, shared_capacity, generator);
+                          num_values_to_search, shared_capacity, generator, dv);
         } else {
             std::printf("Launching using shared memory for row data\n");
             LAUNCH_KERNEL(searchKernel<T, Generator>, num_blocks, num_threads,
                           shared_capacity, *stream.get(), "searchKernel",
                           mat.getView(), candidates, minimums.get(),
-                          num_values_to_search, shared_capacity, generator);
+                          num_values_to_search, shared_capacity, generator, dv);
         }
 
         HIP_ERRCHK(hipEventRecord(*end_event.get(), *stream.get()));
