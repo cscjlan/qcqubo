@@ -8,7 +8,9 @@
             "paraview",
             ".cache",
             "build",
-            "bin"
+            "bin",
+            "data/cqV1.zip",
+            "data/sqV2.zip"
         ]
     },
     "puhti": {
@@ -20,7 +22,9 @@
             "paraview",
             ".cache",
             "build",
-            "bin"
+            "bin",
+            "data/cqV1.zip",
+            "data/sqV2.zip"
         ]
     },
     "lumi": {
@@ -31,7 +35,9 @@
             "compile_commands.json",
             ".cache",
             "build",
-            "bin"
+            "bin",
+            "data/cqV1.zip",
+            "data/sqV2.zip"
         ]
     }
 }
