@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <hip/hip_runtime.h>
 #include <memory>
+#include <numeric>
 #include <span>
 #include <utility>
 #include <vector>
@@ -396,6 +397,7 @@ __host__ __device__ void mx(const SparseView<T> &m, SearchData<T> *sd) {
         for (auto i = lane; i < row_indices.size(); i += lanestride) {
             // j is the column of the matrix
             const auto j = row_indices[i];
+            // dv parameter was added here to each row for every bit that's 1
             sum += (row_data[i] + sd->dv) * sd->candidate[j];
         }
 
@@ -416,6 +418,7 @@ __host__ __device__ void mx(const SparseView<T> &m, SearchData<T> *sd) {
 // When called with multiple blocks, data and scratch must be unique per
 // block.
 template <typename T> __host__ __device__ T blockDotProd(SearchData<T> *sd) {
+    // TODO: is the dv parameter added too many times to the final energy?
     T result = 0.0f;
     for (size_t i = gpu::threadid(); i < sd->len_data; i += gpu::nthreads()) {
         result += sd->candidate[i] * sd->rows[i];
@@ -476,14 +479,10 @@ __host__ __device__ bool minimumRow(const SparseView<T> &m, SearchData<T> *sd,
     };
 
     auto argmin = [](auto a, auto b, auto i, auto j) {
-        auto interpolate = [](auto s, auto a, auto b) {
-            return s * a + static_cast<decltype(a)>(1 - s) * b;
-        };
-
-        // Avoid 'if' within warp by doing a linear interpolation between
-        // the two endpoints with s either 0 or 1
-        const auto s = static_cast<T>(a <= b);
-        return std::make_pair(interpolate(s, a, b), interpolate(s, i, j));
+        const bool swap = b < a;
+        a = swap ? b : a;
+        i = swap ? j : i;
+        return std::make_pair(a, i);
     };
 
     // Find the minimum for each thread among the values in rows
@@ -554,7 +553,8 @@ __host__ __device__ void updateXY(const SparseView<T> &m, SearchData<T> *sd,
 
 template <typename T, typename BitVecGen>
 __host__ __device__ T blockSearch(const SparseView<T> &m, SearchData<T> *sd,
-                                  BitVecGen generator) {
+                                  BitVecGen generator,
+                                  uint64_t &num_bit_flips) {
     const auto n = m.shape().first;
     generator(sd);
     mx(m, sd);
@@ -562,6 +562,7 @@ __host__ __device__ T blockSearch(const SparseView<T> &m, SearchData<T> *sd,
     auto row = 0u;
     while (minimumRow(m, sd, row)) {
         updateXY(m, sd, row);
+        num_bit_flips += 1;
     }
 
     return blockDotProd(sd);
@@ -569,15 +570,23 @@ __host__ __device__ T blockSearch(const SparseView<T> &m, SearchData<T> *sd,
 
 template <typename T, typename BitVecGen>
 __host__ __device__ T search(const SparseView<T> &m, SearchData<T> *sd,
-                             size_t n, BitVecGen generator) {
+                             size_t n, BitVecGen generator,
+                             uint64_t *bit_flips) {
+    uint64_t num_bit_flips = 0ull;
+
     auto minimum = std::numeric_limits<T>::max();
     for (size_t bid = gpu::blockid(); bid < n; bid += gpu::nblocks()) {
-        auto local_minimum = blockSearch(m, sd, generator);
+        auto local_minimum = blockSearch(m, sd, generator, num_bit_flips);
+
         if (gpu::threadid() == 0 && local_minimum < minimum) {
             minimum = local_minimum;
             sd->swapCandidates();
         }
         gpu::syncthreads();
+    }
+
+    if (0 == gpu::threadid()) {
+        bit_flips[gpu::blockid()] = num_bit_flips;
     }
 
     return minimum;
@@ -604,7 +613,7 @@ __host__ __device__ void storeMinimum(T minimum, BitVector best_candidate,
 template <typename T, typename BitVecGen>
 __global__ void searchKernel(SparseView<T> m, SuperSpan<T> global_rows,
                              SuperSpan<uint32_t> best_candidates, T *minimums,
-                             size_t num_values_to_search,
+                             uint64_t *bit_flips, size_t num_values_to_search,
                              size_t shared_capacity, BitVecGen generator,
                              T dv) {
     extern __shared__ uint8_t shared_mem[];
@@ -615,15 +624,16 @@ __global__ void searchKernel(SparseView<T> m, SuperSpan<T> global_rows,
     auto *s = allocator.allocate<SearchData<T>>(1);
     *s = SearchData<T>(allocator, m.shape().first, gpu::nwarps(), dv, rows);
 
-    const auto minimum = search(m, s, num_values_to_search, generator);
+    const auto minimum =
+        search(m, s, num_values_to_search, generator, bit_flips);
     storeMinimum(minimum, s->best_candidate, minimums, best_candidates);
 }
 
 template <typename T, typename BitVecGen>
 __global__ void
 searchKernel(SparseView<T> m, SuperSpan<uint32_t> best_candidates, T *minimums,
-             size_t num_values_to_search, size_t shared_capacity,
-             BitVecGen generator, T dv) {
+             uint64_t *bit_flips, size_t num_values_to_search,
+             size_t shared_capacity, BitVecGen generator, T dv) {
     extern __shared__ uint8_t shared_mem[];
     Allocator allocator(shared_mem, shared_capacity);
 
@@ -631,7 +641,8 @@ searchKernel(SparseView<T> m, SuperSpan<uint32_t> best_candidates, T *minimums,
     auto *s = allocator.allocate<SearchData<T>>(1);
     *s = SearchData<T>(allocator, m.shape().first, gpu::nwarps(), dv);
 
-    const auto minimum = search(m, s, num_values_to_search, generator);
+    const auto minimum =
+        search(m, s, num_values_to_search, generator, bit_flips);
     storeMinimum(minimum, s->best_candidate, minimums, best_candidates);
 }
 
@@ -662,6 +673,7 @@ template <typename T, typename Mem, typename Generator> struct Qubo {
     ST rows = {};
 
     std::unique_ptr<T, decltype(&Mem::free)> minimums;
+    std::unique_ptr<uint64_t, decltype(&Mem::free)> bit_flips;
     Generator generator = {};
     size_t shared_capacity = 0ul;
     T host_minimum = {};
@@ -693,6 +705,9 @@ template <typename T, typename Mem, typename Generator> struct Qubo {
                num_blocks, num_rows),
           minimums(static_cast<T *>(Mem::allocate(sizeof(T) * num_blocks)),
                    Mem::free),
+          bit_flips(static_cast<uint64_t *>(
+                        Mem::allocate(sizeof(uint64_t) * num_blocks)),
+                    Mem::free),
           generator(gen),
           shared_capacity(SearchData<T>::memReq(
               num_rows, max(num_threads >> gpu::WARP_SIZE_BASE_TWO, 1))),
@@ -737,13 +752,15 @@ template <typename T, typename Mem, typename Generator> struct Qubo {
             LAUNCH_KERNEL(searchKernel<T, Generator>, num_blocks, num_threads,
                           shared_capacity, *stream.get(), "searchKernel",
                           mat.getView(), rows, candidates, minimums.get(),
-                          num_values_to_search, shared_capacity, generator, dv);
+                          bit_flips.get(), num_values_to_search,
+                          shared_capacity, generator, dv);
         } else {
             std::printf("Launching using shared memory for row data\n");
             LAUNCH_KERNEL(searchKernel<T, Generator>, num_blocks, num_threads,
                           shared_capacity, *stream.get(), "searchKernel",
                           mat.getView(), candidates, minimums.get(),
-                          num_values_to_search, shared_capacity, generator, dv);
+                          bit_flips.get(), num_values_to_search,
+                          shared_capacity, generator, dv);
         }
 
         HIP_ERRCHK(hipEventRecord(*end_event.get(), *stream.get()));
@@ -786,7 +803,12 @@ template <typename T, typename Mem, typename Generator> struct Qubo {
     }
 
     float searchesPerSecond() {
-        return 1000.0f * static_cast<float>(num_values_to_search) /
-               getRuntime();
+        std::vector<uint64_t> h_bit_flips(num_blocks, 0);
+        gpu::memcpy(h_bit_flips.data(), bit_flips.get(),
+                    sizeof(uint64_t) * num_blocks);
+        const uint64_t total_bit_flips =
+            std::reduce(h_bit_flips.cbegin(), h_bit_flips.cend(), 0ull);
+
+        return 1000.0f * static_cast<float>(total_bit_flips) / getRuntime();
     }
 };

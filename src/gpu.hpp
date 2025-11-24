@@ -247,16 +247,15 @@ __device__ std::pair<T, U> warpArgSearch(T t, U u, Op op) {
     uint32_t minlane = lane;
     uint32_t delta = gpu::WARP_SIZE >> 1u;
     while (delta > 0ul) {
-        auto interpolate = [](auto a, auto b, auto s) {
-            return s * a + (1 - s) * b;
-        };
-        const auto s = static_cast<T>(lane + delta < gpu::nlanes());
         // The lanes that are not active (seem to) have zeros in them.
         // If we're doing a minimum/maximum search with strictly
         // positive/negative values, we'll end up with a false min/max of zero
         // taken from an inactive lane, unless we check for that.
-        auto val = interpolate(__shfl_down(t, delta), t, s);
-        auto ind = interpolate(__shfl_down(minlane, delta), minlane, s);
+        const auto active = lane + delta < gpu::nlanes();
+        auto val = __shfl_down(t, delta);
+        val = active ? val : t;
+        auto ind = __shfl_down(minlane, delta);
+        ind = active ? ind : minlane;
 
         std::tie(t, minlane) = op(val, t, ind, minlane);
         delta >>= 1u;

@@ -116,10 +116,6 @@ void outputCandidate(const std::vector<uint32_t> &candidate,
     }
 }
 
-/*
- * TODO:
- * constant from script
- * */
 int main(int argc, char **argv) {
     const auto [input, gpu_id] = handleInput(argc, argv);
 
@@ -160,8 +156,8 @@ int main(int argc, char **argv) {
 
     qubo.search();
 
-    std::printf("minimum: %f, %f candidates/s\n", qubo.getMinimum(),
-                qubo.searchesPerSecond());
+    std::printf("minimum: %f, %f x 10^6 searches/s\n", qubo.getMinimum(),
+                qubo.searchesPerSecond() / 1e6f);
 
     const auto bc = qubo.getBits();
     outputCandidate(bc, input["output_filename"].get<std::string>());
