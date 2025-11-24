@@ -1,6 +1,9 @@
 ## Build on LUMI
 
-Run `scripts/build.sh` on e.g a login node. This builds an executable `qubo` in the `bin/` directory.
+1. Clone this repository to a directory: `git clone https://github.com/cscjlan/qcqubo.git`
+2. `cd qcqubo`
+3. Create a directory for binaries: `mkdir bin`
+4. Run `scripts/build.sh` on e.g a login node. This builds an executable `qubo` in the `bin/` directory.
 
 ## Run on LUMI
 
