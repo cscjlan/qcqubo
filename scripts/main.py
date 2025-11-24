@@ -1,7 +1,5 @@
 import numpy as np
-from numpy.ma import minimum
 import scipy.sparse as sparse
-import scipy.sparse.linalg as linalg
 
 
 def generate_sparse_symmetric_real_matrix(n):
@@ -11,6 +9,7 @@ def generate_sparse_symmetric_real_matrix(n):
     prob = 1.0 - np.sqrt(1.0 - np.log10(n) ** 4 / n)
     mask = np.random.binomial(1, prob, (n, n))
     mask = ((mask + mask.T) > 0).astype(np.int64)
+    np.fill_diagonal(mask, 1)
 
     return sparse.csr_array(mask * mat)
 
@@ -109,11 +108,12 @@ def main():
 
 
 if __name__ == "__main__":
-    # sq = generate_sparse_symmetric_real_matrix(20000)
-    # with open("data/large_matrix.csv", "w") as f:
-    #    sq.indptr.tofile(f, sep=",")
-    #    f.write("\n")
-    #    sq.indices.tofile(f, sep=",")
-    #    f.write("\n")
-    #    sq.data.tofile(f, sep=",")
-    main()
+    n = 10000
+    sq = generate_sparse_symmetric_real_matrix(n)
+    with open(f"data/csr_matrix_{n}.csv", "w") as f:
+        sq.indptr.tofile(f, sep=",")
+        f.write("\n")
+        sq.indices.tofile(f, sep=",")
+        f.write("\n")
+        sq.data.tofile(f, sep=",")
+    # main()
