@@ -18,3 +18,25 @@ Specifically:
 After you're satisfied with the inputs, use `sbatch -A project_YOUR_PROJECT_NUMBER scripts/lumi_run.sh`
 to queue the program, where `YOUR_PROJECT_NUMBER` is a number of the project you want the billing of the used
 resources to go to.
+
+## Input matrix
+
+The matrix can be given as a dense `.csv` file, in which case the zeroes should be included.
+
+If it's given as a csr matrix, the `.csv` file should contain three rows (for a N x N matrix):
+1. `indptr`
+2. `indices`
+3. `data`.
+
+See the [SciPy csr matrix](https://docs.scipy.org/doc/scipy/reference/generated/scipy.sparse.csr_matrix.html) for the meaning of the names.
+
+Given a SciPy csr matrix `csr_mat`, the following Python snippet writes the matrix in the correct format for this program:
+```python
+    with open(f"data/csr_matrix.csv", "w") as f:
+        csr_mat.indptr.tofile(f, sep=",")
+        f.write("\n")
+        csr_mat.indices.tofile(f, sep=",")
+        f.write("\n")
+        csr_mat.data.tofile(f, sep=",")
+```
+
