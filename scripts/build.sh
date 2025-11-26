@@ -1,7 +1,6 @@
 #!/bin/bash
 
-ml purge
-
+ml craype-x86-trento
 ml PrgEnv-cray/8.5.0
 ml craype-accel-amd-gfx90a
 ml rocm/6.0.3

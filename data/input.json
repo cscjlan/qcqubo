@@ -1,7 +1,7 @@
 {
     "seed": 123,
     "num_to_search": 100000,
-    "matrix_filename": "data/sqv.csv",
+    "matrix_filename": "data/csr_matrix_10000.csv",
     "output_filename": "data/best_candidate.csv",
     "dv": 0.000313107
 }

@@ -18,4 +18,3 @@ Specifically:
 After you're satisfied with the inputs, use `sbatch -A project_YOUR_PROJECT_NUMBER scripts/lumi_run.sh`
 to queue the program, where `YOUR_PROJECT_NUMBER` is a number of the project you want the billing of the used
 resources to go to.
-

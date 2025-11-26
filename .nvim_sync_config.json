@@ -10,7 +10,9 @@
             "build",
             "bin",
             "data/cqV1.zip",
-            "data/sqV2.zip"
+            "data/cqV1.mtx",
+            "data/sqV2.zip",
+            "data/sqV2.mtx"
         ]
     },
     "puhti": {
@@ -24,7 +26,9 @@
             "build",
             "bin",
             "data/cqV1.zip",
-            "data/sqV2.zip"
+            "data/cqV1.mtx",
+            "data/sqV2.zip",
+            "data/sqV2.mtx"
         ]
     },
     "lumi": {
@@ -37,7 +41,9 @@
             "build",
             "bin",
             "data/cqV1.zip",
-            "data/sqV2.zip"
+            "data/cqV1.mtx",
+            "data/sqV2.zip",
+            "data/sqV2.mtx"
         ]
     }
 }

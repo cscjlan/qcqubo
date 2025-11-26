@@ -2,6 +2,7 @@
 #include "qubo.hpp"
 #include <fstream>
 #include <hiprand/hiprand_kernel.h>
+#include <mpi.h>
 #include <sstream>
 
 __global__ void setupRandKernel(hiprandState *states, uint32_t gpu_id,
@@ -83,11 +84,9 @@ SparseMatrix<T, M> matrixFromFile(const std::string &fname) {
     return SparseMatrix<T, M>(indptr, indices, data);
 }
 
-std::pair<nlohmann::json, uint32_t> handleInput(int argc, char **argv) {
-    if (argc < 3) {
-        std::printf(
-            "Give an input.json and gpu ID as input: '%s input.json gpuID'\n",
-            argv[0]);
+nlohmann::json handleInput(int argc, char **argv) {
+    if (argc < 2) {
+        std::printf("Give an input.json as input: '%s input.json'\n", argv[0]);
     }
     const auto fname = argv[1];
     nlohmann::json input_json;
@@ -98,9 +97,8 @@ std::pair<nlohmann::json, uint32_t> handleInput(int argc, char **argv) {
     } else {
         std::exit(EXIT_FAILURE);
     }
-    const uint32_t gpu_id = std::stoul(argv[2]);
 
-    return std::make_pair(input_json, gpu_id);
+    return input_json;
 }
 
 void outputCandidate(const std::vector<uint32_t> &candidate,
@@ -117,7 +115,14 @@ void outputCandidate(const std::vector<uint32_t> &candidate,
 }
 
 int main(int argc, char **argv) {
-    const auto [input, gpu_id] = handleInput(argc, argv);
+    int32_t rank = 0;
+    int32_t ntasks = 0;
+
+    MPI_Init(&argc, &argv);
+    MPI_Comm_size(MPI_COMM_WORLD, &ntasks);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+    const auto input = handleInput(argc, argv);
 
     static constexpr size_t num_blocks = 1024ul;
     const uint32_t seed = input["seed"].get<uint32_t>();
@@ -152,15 +157,34 @@ int main(int argc, char **argv) {
               input["dv"].get<float>());
 
     LAUNCH_KERNEL(setupRandKernel, num_blocks, num_threads, 0, 0, "", states,
-                  gpu_id, seed);
+                  static_cast<uint32_t>(rank), seed);
 
     qubo.search();
 
-    std::printf("minimum: %f, %f x 10^6 searches/s\n", qubo.getMinimum(),
-                qubo.searchesPerSecond() / 1e6f);
+    // Do a reduction over the MPI ranks
+    struct Minloc {
+        float minimum = 0.0f;
+        int32_t rank = 0;
+    };
+    auto rank_minloc = Minloc(qubo.getMinimum(), rank);
+    auto world_minloc = Minloc(0.0f, 0);
+    MPI_Allreduce(&rank_minloc, &world_minloc, 1, MPI_FLOAT_INT, MPI_MINLOC,
+                  MPI_COMM_WORLD);
 
-    const auto bc = qubo.getBits();
-    outputCandidate(bc, input["output_filename"].get<std::string>());
+    // Only the rank with the minimum outputs
+    if (rank == world_minloc.rank) {
+        assert(world_minloc.minimum == rank_minloc.minimum);
+
+        std::printf("Rank %d had the minimum across %d processes: %f. %.3f"
+                    "x10^6 searches/s\n",
+                    rank, ntasks, world_minloc.minimum,
+                    qubo.searchesPerSecond() / 1e6f);
+
+        const auto bc = qubo.getBits();
+        outputCandidate(bc, input["output_filename"].get<std::string>());
+    }
+
+    MPI_Finalize();
 
     return 0;
 }
